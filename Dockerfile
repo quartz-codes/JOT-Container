@@ -161,9 +161,9 @@ COPY src/ ./src/
 RUN cargo build --release --locked --bin JOT-Container
 
 # ---------------------------
-# 실제 실행 환경: SDK, WASI용 언어 도구, Python 템플릿을 모은다.
+# Debian 테스트 환경: 배포에 쓰는 SDK, WASI용 언어 도구, Python 템플릿을 모은다.
 # ---------------------------
-FROM debian:${DEBIAN_VERSION} AS runtime
+FROM debian:${DEBIAN_VERSION} AS test-runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libc6 libgcc-s1 libstdc++6 libtinfo6 zlib1g \
@@ -191,8 +191,8 @@ RUN /opt/wasi-sdk/bin/clang --version \
     && go version \
     && test -d /opt/rust/lib/rustlib/wasm32-wasip1/lib
 
-# 테스트는 배포와 같은 실행 환경에 프로젝트용 Rust와 빌드 도구만 추가한다.
-FROM runtime AS test
+# 테스트 환경에 프로젝트용 Rust와 빌드 도구를 추가한다.
+FROM test-runtime AS test
 RUN apt-get update \
     && apt-get install -y --no-install-recommends gcc libc6-dev ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -207,8 +207,37 @@ RUN cargo chef cook --locked --recipe-path recipe.json
 COPY . .
 RUN cargo test --locked
 
-# 배포 이미지는 실행 환경에 서버 바이너리만 추가한다.
-FROM runtime AS final
+# WASI SDK의 libedit가 요구하는 libtinfo를 최종 이미지와 같은 Debian 릴리스에서 가져온다.
+FROM debian:trixie-slim AS runtime-libtinfo
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libtinfo6 \
+    && mkdir -p /out \
+    && cp -L /usr/lib/*-linux-gnu/libtinfo.so.6 /out/libtinfo.so.6 \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM gcr.io/distroless/cc-debian13:nonroot AS final
+COPY --from=runtime-libtinfo /out/libtinfo.so.6 /usr/lib/libtinfo.so.6
+COPY --from=runtime-wasi-sdk-stage /opt/wasi-sdk /opt/wasi-sdk
+COPY --from=wasi-language-stage /opt/rust /opt/rust
+COPY --from=wasi-language-stage /opt/go /opt/go
+COPY --from=build-wasi-python-template /out/python-template.wasm /opt/jot/python/python-template.wasm
 COPY --from=build /app/target/release/JOT-Container /usr/local/bin/JOT-Container
+
+ENV PATH=/opt/rust/bin:/opt/go/bin:${PATH}
+ENV GRPC_ADDR=0.0.0.0:50051
+ENV WASI_SDK_PATH=/opt/wasi-sdk
+ENV CLANG_PATH=/opt/wasi-sdk/bin/clang
+ENV CLANGPP_PATH=/opt/wasi-sdk/bin/clang++
+ENV CLANG_ADDITIONAL_FLAGS="--target=wasm32-wasip1 --sysroot=/opt/wasi-sdk/share/wasi-sysroot"
+ENV CLANGPP_ADDITIONAL_FLAGS="--target=wasm32-wasip1 --sysroot=/opt/wasi-sdk/share/wasi-sysroot"
+ENV RUSTC_PATH=/opt/rust/bin/rustc
+ENV GOROOT=/opt/go
+ENV GO_PATH=/opt/go/bin/go
+ENV PYTHON_TEMPLATE_PATH=/opt/jot/python/python-template.wasm
+
+RUN ["/opt/wasi-sdk/bin/clang", "--version"]
+RUN ["/opt/rust/bin/rustc", "--version"]
+RUN ["/opt/go/bin/go", "version"]
+
 EXPOSE 50051
-CMD ["JOT-Container"]
+CMD ["/usr/local/bin/JOT-Container"]
