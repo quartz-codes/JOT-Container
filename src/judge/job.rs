@@ -1,19 +1,34 @@
+use std::sync::Arc;
+
 use crate::judge::{
     Problem,
     checker::lcmp_checker::LcmpChecker,
     compiler,
     grader::{self, Grader},
-    testcase::{TestcaseFetcher, lru_fetcher::LruTestcaseFetcher},
+    testcase::{TestcaseFetcher, Testcases},
 };
 use jot_proto::judge::v1::{self as proto, JudgeEvent, judge_result::Verdict};
-use lazy_static::lazy_static;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
-// 일단 임시로 static으로 해놨는데 나중에 config등을 이용해서 더 좋게 바꿀 수 있을 듯
-lazy_static! {
-    static ref TESTCASE_FETCHER: LruTestcaseFetcher = LruTestcaseFetcher::new();
+// JudgeRequest currently identifies only a problem.
+const DEFAULT_SUBPROBLEM_ID: i64 = 1;
+
+async fn fetch_testcases(problem_id: i64) -> Result<Arc<Testcases>, String> {
+    let fetcher = crate::config::testcase_fetcher();
+    let mut stream = fetcher
+        .get_subproblem_test_cases(problem_id, DEFAULT_SUBPROBLEM_ID)
+        .await;
+    let mut cases = Vec::new();
+    while let Some(item) = stream.recv().await {
+        cases.push(item.map_err(|error| error.to_string())?);
+    }
+    if cases.is_empty() {
+        return Err("Testcases not found".into());
+    }
+    Ok(Arc::new(cases))
 }
+
 pub struct JudgeJob {
     request: jot_proto::judge::v1::JudgeRequest,
     response_channel: tokio::sync::mpsc::Sender<jot_proto::judge::v1::JudgeEvent>,
@@ -124,35 +139,21 @@ impl JudgeJob {
             })
             .await?;
 
-        let Ok(testcases) = TESTCASE_FETCHER.get(self.request.problem_id).await else {
-            let judge_result = jot_proto::judge::v1::JudgeResult {
-                verdict: Some(Verdict::SystemError(proto::JudgeSystemError {
-                    error_message: "Failed to fetch testcases".into(),
-                })),
-            };
-            let event = JudgeEvent {
-                request_id: self.request.request_id,
-                payload: Some(jot_proto::judge::v1::judge_event::Payload::Result(
-                    judge_result,
-                )),
-            };
-            self.response_channel.send(event).await?;
-            return Ok(());
-        };
-        let Some(testcases) = testcases else {
-            let judge_result = jot_proto::judge::v1::JudgeResult {
-                verdict: Some(Verdict::SystemError(proto::JudgeSystemError {
-                    error_message: "Testcases not found".into(),
-                })),
-            };
-            let event = JudgeEvent {
-                request_id: self.request.request_id,
-                payload: Some(jot_proto::judge::v1::judge_event::Payload::Result(
-                    judge_result,
-                )),
-            };
-            self.response_channel.send(event).await?;
-            return Ok(());
+        let testcases = match fetch_testcases(self.request.problem_id).await {
+            Ok(testcases) => testcases,
+            Err(error_message) => {
+                self.response_channel
+                    .send(JudgeEvent {
+                        request_id: self.request.request_id,
+                        payload: Some(proto::judge_event::Payload::Result(proto::JudgeResult {
+                            verdict: Some(Verdict::SystemError(proto::JudgeSystemError {
+                                error_message,
+                            })),
+                        })),
+                    })
+                    .await?;
+                return Ok(());
+            }
         };
 
         let total_cases = testcases.len() as u32;

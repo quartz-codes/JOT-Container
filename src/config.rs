@@ -1,4 +1,61 @@
-use std::{env, net::SocketAddr, sync::OnceLock};
+use std::{
+    env,
+    net::SocketAddr,
+    num::NonZeroUsize,
+    sync::{Arc, OnceLock},
+};
+
+use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
+
+use crate::judge::{s3_repository::S3Repository, testcase::cached_fetcher::CachedTestcaseFetcher};
+
+struct RustFsConfig {
+    endpoint: String,
+    bucket: String,
+    region: String,
+    access_key: String,
+    secret_key: String,
+}
+
+impl RustFsConfig {
+    fn load_from_env() -> Result<Self, String> {
+        let required = |name| match env::var(name) {
+            Ok(value) if !value.trim().is_empty() => Ok(value),
+            Ok(_) => Err(format!("{name} must not be empty")),
+            Err(error) => Err(format!("{name}: {error}")),
+        };
+        let region = match env::var("RUSTFS_REGION") {
+            Ok(region) if !region.trim().is_empty() => region,
+            Ok(_) => return Err("RUSTFS_REGION must not be empty".into()),
+            Err(env::VarError::NotPresent) => "us-east-1".into(),
+            Err(error) => return Err(format!("RUSTFS_REGION: {error}")),
+        };
+        Ok(Self {
+            endpoint: required("RUSTFS_ENDPOINT")?,
+            bucket: required("RUSTFS_BUCKET")?,
+            region,
+            access_key: required("RUSTFS_ACCESS_KEY")?,
+            secret_key: required("RUSTFS_SECRET_KEY")?,
+        })
+    }
+
+    fn into_repository(self) -> S3Repository {
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .endpoint_url(self.endpoint)
+            .region(Region::new(self.region))
+            .credentials_provider(Credentials::new(
+                self.access_key,
+                self.secret_key,
+                None,
+                None,
+                "rustfs",
+            ))
+            .force_path_style(true)
+            .build();
+        S3Repository::new(aws_sdk_s3::Client::from_conf(config), self.bucket)
+    }
+}
 
 #[derive(Debug)]
 struct Config {
@@ -44,26 +101,52 @@ impl Config {
     }
 }
 
-static CONFIG: OnceLock<Config> = OnceLock::new();
+struct AppConfig {
+    runtime: Config,
+    testcase_fetcher: CachedTestcaseFetcher,
+}
 
-// used only prodction code, not test code
+static CONFIG: OnceLock<AppConfig> = OnceLock::new();
+
 pub fn init_config() -> Result<(), String> {
-    let config = Config::load_from_env()?;
+    if CONFIG.get().is_some() {
+        return Ok(());
+    }
+    let runtime = Config::load_from_env()?;
+    let rustfs = RustFsConfig::load_from_env()?;
+    CONFIG.get_or_init(|| {
+        let repository = Arc::new(rustfs.into_repository());
+        AppConfig {
+            runtime,
+            testcase_fetcher: CachedTestcaseFetcher::new(
+                repository,
+                NonZeroUsize::new(32).unwrap(),
+            ),
+        }
+    });
+    Ok(())
+}
+
+fn app_config() -> &'static AppConfig {
     CONFIG
-        .set(config)
-        .map_err(|_| "Failed to set config".to_string())
+        .get()
+        .expect("Call init_config() before using config")
+}
+
+pub fn testcase_fetcher() -> &'static CachedTestcaseFetcher {
+    &app_config().testcase_fetcher
 }
 
 #[cfg(not(test))]
 fn with_config<R>(f: impl FnOnce(&Config) -> R) -> R {
-    f(CONFIG
-        .get()
-        .expect("Call init_config() before using config"))
+    f(&app_config().runtime)
 }
 
-// 단위 테스트: getter를 호출할 때마다 다시 로드하고 검증
 #[cfg(test)]
 fn with_config<R>(f: impl FnOnce(&Config) -> R) -> R {
+    if let Some(config) = CONFIG.get() {
+        return f(&config.runtime);
+    }
     let loaded = Config::load_from_env().expect("Not valid environment variables for testing");
     f(&loaded)
 }

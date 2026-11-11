@@ -1,6 +1,6 @@
 use tokio::sync::mpsc;
 
-use crate::judge::{Problem, testcase::Testcase};
+use crate::judge::Problem;
 
 use super::checker::Checker;
 use super::executor::{ExecuteError, ExecuteResult, Executor};
@@ -72,8 +72,19 @@ impl<C: Checker + 'static, E: Executor + 'static> Grader<C, E> {
                 instruction_count: 0,
             };
             for (idx, test) in problem.tests.iter().enumerate() {
+                let (Ok(input), Ok(answer)) = (
+                    std::str::from_utf8(&test.input),
+                    std::str::from_utf8(&test.answer),
+                ) else {
+                    grade_result.verdict = Verdict::SystemError(Some(format!(
+                        "Testcase {} contains invalid UTF-8",
+                        idx + 1
+                    )));
+                    let _ = tx.send(GradeStreamData::Result(grade_result)).await;
+                    return;
+                };
                 let res = executor
-                    .execute(&test.input, problem.memory_limit, problem.instruction_limit)
+                    .execute(input, problem.memory_limit, problem.instruction_limit)
                     .await;
                 match res {
                     Ok(ExecuteResult {
@@ -85,7 +96,7 @@ impl<C: Checker + 'static, E: Executor + 'static> Grader<C, E> {
                         grade_result.instruction_count =
                             grade_result.instruction_count.max(instruction_count);
 
-                        if !checker.check(&output, &test.answer).await.unwrap_or(false) {
+                        if !checker.check(&output, answer).await.unwrap_or(false) {
                             let _ = tx
                                 .send(GradeStreamData::Result(GradeResult {
                                     verdict: Verdict::WrongAnswer,
