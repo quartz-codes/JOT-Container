@@ -36,7 +36,8 @@ Rust 프로세스는 자주 사용되는 테스트 케이스를 메모리에 캐
 
 ## WASI 및 언어 도구 체인
 
-기반 이미지는 Debian Trixie의 공식 최소 변형인 `debian:trixie-slim`입니다.
+빌드와 테스트는 기본적으로 `debian:trixie-slim`을 사용합니다.
+최종 이미지는 `gcr.io/distroless/cc-debian13:nonroot`를 기반으로 합니다.
 SDK 버전은 `WASI_SDK_VERSION`(기본 `34.0`), 다운로드할 아키텍처는 `WASI_SDK_ARCH`로 지정합니다.
 아키텍처를 생략하면 Docker의 `TARGETARCH`를 사용하며, `amd64`는 릴리스 파일명의 `x86_64`로 변환합니다.
 WASI SDK 체크섬은 별도로 검증하지 않습니다.
@@ -67,9 +68,9 @@ rustup-stage
     ├── chef → planner / build
     └── test에 프로젝트용 Rust·Cargo 복사
 
-debian:trixie-slim → runtime ← SDK + WASI용 Rust·Go + Python 템플릿
-                    ├── test: 프로젝트용 Rust·Cargo, 빌드 도구, 소스 추가 → cargo test
-                    └── final: build의 서버 실행 파일만 추가 → 실행
+debian:trixie-slim → test-runtime ← SDK + WASI용 Rust·Go + Python 템플릿
+                    └── test: 프로젝트용 Rust·Cargo, 빌드 도구, 소스 추가 → cargo test
+cc-debian13:nonroot → final ← SDK + WASI용 Rust·Go + Python 템플릿 + libtinfo + 서버
 ```
 
 ```sh
@@ -86,10 +87,12 @@ Clang·LLD가 사용하는 LLVM·libclang-cpp·libedit와 진단용 llvm-symboli
 `wasi-language-stage`에서는 Rust 호스트 표준 라이브러리, Cargo, rustdoc, 디버거 보조 도구를 제거합니다.
 Rust 라이선스·저작권 고지, 컴파일러 공유 라이브러리, `rust-lld`, WASI 표준 라이브러리와
 Go 표준 라이브러리 소스는 유지합니다. 서버 빌드는 `project-rust-stage`의 도구 체인을 사용합니다.
-`runtime`은 새 Debian 이미지에 `libc6`, `libgcc-s1`, `libstdc++6`, `libtinfo6`, `zlib1g`를 확보한 후
+`test-runtime`은 새 Debian 이미지에 `libc6`, `libgcc-s1`, `libstdc++6`, `libtinfo6`, `zlib1g`를 확보한 후
 각 설치 단계에서 SDK, 정리된 Rust, Go, Python 템플릿을 복사합니다.
-`final`은 `runtime`에 서버 실행 파일만 추가합니다. 기본 `GRPC_ADDR`는 `0.0.0.0:50051`입니다.
-`test`도 `runtime`에서 시작하며, `project-rust-stage`의 Rust·Cargo를 `/opt/project-rust`에 복사합니다.
+`final`은 동일한 도구 체인과 서버 실행 파일을 복사하고, `runtime-libtinfo`에서
+WASI SDK에 필요한 `libtinfo.so.6`을 가져옵니다. 서버는 비루트 사용자로 실행되며
+기본 `GRPC_ADDR`는 `0.0.0.0:50051`입니다.
+`test`는 `test-runtime`에서 시작하며, `project-rust-stage`의 Rust·Cargo를 `/opt/project-rust`에 복사합니다.
 테스트는 배포용 `/opt/rust`와 동일한 SDK·Go·Python 환경을 사용합니다.
 테스트는 `cargo-chef`와 `recipe.json`을 복사해 소스 복사 전에 의존성을 빌드합니다.
 Cargo 레지스트리와 `target`은 일반 Docker 레이어에 남겨 기존 GHA `mode=max` 캐시로 재사용합니다.
@@ -133,6 +136,6 @@ perl scripts/build_python_template.pl --python-version 3.14.7 \
 이미 빌드한 CPython을 다시 링크할 때는 `--python-version` 대신 기존의
 `--source-dir`, `--build-dir`, `--native-build-dir` 옵션을 사용할 수 있습니다.
 
-`runtime`은 템플릿을 `/opt/jot/python/python-template.wasm`으로 복사하고
+`test-runtime`과 `final`은 템플릿을 `/opt/jot/python/python-template.wasm`으로 복사하고
 `PYTHON_TEMPLATE_PATH`로 경로를 제공합니다. CPython 소스와 네이티브 빌드 도구는
 최종 이미지에 복사하지 않습니다.
