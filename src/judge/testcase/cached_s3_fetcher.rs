@@ -6,22 +6,27 @@ use prost::Message;
 use tokio::sync::mpsc;
 
 use super::{Testcase, TestcaseFetchError, TestcaseFetcher, Testcases};
-use crate::judge::s3_repository::{CachedS3Repository, S3Repository};
+use crate::judge::repository::s3_repository::CachedS3Repository;
 
-pub struct CachedTestcaseFetcher {
-    repository: CachedS3Repository<Testcase, String>,
+pub struct CachedS3TestcaseFetcher {
+    repository: Arc<CachedS3Repository<Testcase, String>>,
 }
 
-impl CachedTestcaseFetcher {
-    pub fn new(repository: Arc<S3Repository>, capacity: NonZeroUsize) -> Self {
+impl CachedS3TestcaseFetcher {
+    pub fn new(client: aws_sdk_s3::Client, bucket: String, capacity: NonZeroUsize) -> Self {
         Self {
-            repository: CachedS3Repository::new(repository, capacity, decode_testcase_file),
+            repository: Arc::new(CachedS3Repository::new(
+                client,
+                bucket,
+                capacity,
+                decode_testcase_file,
+            )),
         }
     }
 }
 
 #[async_trait]
-impl TestcaseFetcher for CachedTestcaseFetcher {
+impl TestcaseFetcher for CachedS3TestcaseFetcher {
     async fn get_subproblem_test_cases(
         &self,
         problem_id: i64,

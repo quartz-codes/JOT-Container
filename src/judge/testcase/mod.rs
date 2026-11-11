@@ -19,6 +19,6 @@ pub trait TestcaseFetcher {
     ) -> UnboundedReceiver<Result<Testcase, TestcaseFetchError>>;
 }
 
-pub type TestcaseFetchError = crate::judge::s3_repository::CachedS3Error<String>;
+pub type TestcaseFetchError = crate::judge::repository::s3_repository::CachedS3Error<String>;
 
-pub mod cached_fetcher;
+pub mod cached_s3_fetcher;

@@ -1,13 +1,8 @@
-use std::{
-    env,
-    net::SocketAddr,
-    num::NonZeroUsize,
-    sync::{Arc, OnceLock},
-};
+use std::{env, net::SocketAddr, num::NonZeroUsize, sync::OnceLock};
 
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 
-use crate::judge::{s3_repository::S3Repository, testcase::cached_fetcher::CachedTestcaseFetcher};
+use crate::judge::testcase::cached_s3_fetcher::CachedS3TestcaseFetcher;
 
 struct RustFsConfig {
     endpoint: String,
@@ -39,7 +34,7 @@ impl RustFsConfig {
         })
     }
 
-    fn into_repository(self) -> S3Repository {
+    fn into_testcase_fetcher(self) -> CachedS3TestcaseFetcher {
         let config = aws_sdk_s3::Config::builder()
             .behavior_version(BehaviorVersion::latest())
             .endpoint_url(self.endpoint)
@@ -53,7 +48,11 @@ impl RustFsConfig {
             ))
             .force_path_style(true)
             .build();
-        S3Repository::new(aws_sdk_s3::Client::from_conf(config), self.bucket)
+        CachedS3TestcaseFetcher::new(
+            aws_sdk_s3::Client::from_conf(config),
+            self.bucket,
+            NonZeroUsize::new(32).unwrap(),
+        )
     }
 }
 
@@ -103,7 +102,7 @@ impl Config {
 
 struct AppConfig {
     runtime: Config,
-    testcase_fetcher: CachedTestcaseFetcher,
+    testcase_fetcher: CachedS3TestcaseFetcher,
 }
 
 static CONFIG: OnceLock<AppConfig> = OnceLock::new();
@@ -114,15 +113,9 @@ pub fn init_config() -> Result<(), String> {
     }
     let runtime = Config::load_from_env()?;
     let rustfs = RustFsConfig::load_from_env()?;
-    CONFIG.get_or_init(|| {
-        let repository = Arc::new(rustfs.into_repository());
-        AppConfig {
-            runtime,
-            testcase_fetcher: CachedTestcaseFetcher::new(
-                repository,
-                NonZeroUsize::new(32).unwrap(),
-            ),
-        }
+    CONFIG.get_or_init(|| AppConfig {
+        runtime,
+        testcase_fetcher: rustfs.into_testcase_fetcher(),
     });
     Ok(())
 }
@@ -133,7 +126,7 @@ fn app_config() -> &'static AppConfig {
         .expect("Call init_config() before using config")
 }
 
-pub fn testcase_fetcher() -> &'static CachedTestcaseFetcher {
+pub fn testcase_fetcher() -> &'static CachedS3TestcaseFetcher {
     &app_config().testcase_fetcher
 }
 
