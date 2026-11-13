@@ -148,10 +148,22 @@ fn assert_complete(events: &[JudgeEvent]) {
 
 #[tokio::test]
 async fn judge_rpc_stream_ends_with_a_terminal_result() {
-    let (mut server, mut client, _s3) = start_server().await;
-    let events = judge_events(&mut client, request(1)).await;
-    assert!(events.iter().all(|event| event.request_id == 1));
-    assert_complete(&events);
+    let (mut server, mut client, s3) = start_server().await;
+    for request_id in [1, 2] {
+        let events = judge_events(&mut client, request(request_id)).await;
+        assert!(events.iter().all(|event| event.request_id == request_id));
+        assert_complete(&events);
+    }
+    assert_eq!(
+        s3.head_requests(),
+        2,
+        "each judge request should look up the ETag only once"
+    );
+    assert_eq!(
+        s3.downloads(),
+        1,
+        "requests for the same object version should reuse the cached testcases"
+    );
     server.kill().await.unwrap();
 }
 
@@ -191,6 +203,7 @@ async fn judge_queue_streams_concurrent_requests_with_independent_terminal_resul
         assert!(events.iter().all(|event| event.request_id == request_id));
         assert_complete(&events);
     }
+    assert_eq!(s3.head_requests(), 3, "expected one HEAD per request");
     assert_eq!(
         s3.downloads(),
         1,

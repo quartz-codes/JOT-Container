@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use tokio::sync::mpsc::UnboundedReceiver;
+
 #[derive(Clone, prost::Message)]
 pub struct Testcase {
     #[prost(bytes = "bytes", tag = "1")]
@@ -11,14 +11,14 @@ pub struct Testcase {
 pub type Testcases = Vec<Testcase>;
 
 #[async_trait]
-pub trait TestcaseFetcher {
-    async fn get_subproblem_test_cases(
+pub trait TestcasesFetcher {
+    async fn get_subproblem_testcases(
         &self,
         problem_id: i64,
         subproblem_id: i64,
-    ) -> UnboundedReceiver<Result<Testcase, TestcaseFetchError>>;
+    ) -> Result<Testcases, TestcaseFetchError>;
 }
 
-pub type TestcaseFetchError = crate::judge::repository::s3_repository::CachedS3Error<String>;
+pub type TestcaseFetchError = crate::judge::repository::S3RepositoryRequestError<String>;
 
-pub mod cached_s3_fetcher;
+pub mod s3_fetcher;

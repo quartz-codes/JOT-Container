@@ -1,8 +1,8 @@
-use std::{env, net::SocketAddr, num::NonZeroUsize, sync::OnceLock};
+use std::{env, net::SocketAddr, sync::OnceLock};
 
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 
-use crate::judge::testcase::cached_s3_fetcher::CachedS3TestcaseFetcher;
+use crate::judge::testcase::s3_fetcher::S3TestcaseFetcher;
 
 struct RustFsConfig {
     endpoint: String,
@@ -34,7 +34,7 @@ impl RustFsConfig {
         })
     }
 
-    fn into_testcase_fetcher(self) -> CachedS3TestcaseFetcher {
+    fn into_testcase_fetcher(self) -> S3TestcaseFetcher {
         let config = aws_sdk_s3::Config::builder()
             .behavior_version(BehaviorVersion::latest())
             .endpoint_url(self.endpoint)
@@ -48,11 +48,7 @@ impl RustFsConfig {
             ))
             .force_path_style(true)
             .build();
-        CachedS3TestcaseFetcher::new(
-            aws_sdk_s3::Client::from_conf(config),
-            self.bucket,
-            NonZeroUsize::new(32).unwrap(),
-        )
+        S3TestcaseFetcher::new(aws_sdk_s3::Client::from_conf(config), self.bucket)
     }
 }
 
@@ -102,7 +98,7 @@ impl Config {
 
 struct AppConfig {
     runtime: Config,
-    testcase_fetcher: CachedS3TestcaseFetcher,
+    testcase_fetcher: S3TestcaseFetcher,
 }
 
 static CONFIG: OnceLock<AppConfig> = OnceLock::new();
@@ -126,7 +122,7 @@ fn app_config() -> &'static AppConfig {
         .expect("Call init_config() before using config")
 }
 
-pub fn testcase_fetcher() -> &'static CachedS3TestcaseFetcher {
+pub fn testcase_fetcher() -> &'static S3TestcaseFetcher {
     &app_config().testcase_fetcher
 }
 

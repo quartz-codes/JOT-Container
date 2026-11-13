@@ -5,7 +5,7 @@ use crate::judge::{
     checker::lcmp_checker::LcmpChecker,
     compiler,
     grader::{self, Grader},
-    testcase::{TestcaseFetcher, Testcases},
+    testcase::{Testcases, TestcasesFetcher},
 };
 use jot_proto::judge::v1::{self as proto, JudgeEvent, judge_result::Verdict};
 
@@ -15,14 +15,10 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 const DEFAULT_SUBPROBLEM_ID: i64 = 1;
 
 async fn fetch_testcases(problem_id: i64) -> Result<Arc<Testcases>, String> {
-    let fetcher = crate::config::testcase_fetcher();
-    let mut stream = fetcher
-        .get_subproblem_test_cases(problem_id, DEFAULT_SUBPROBLEM_ID)
-        .await;
-    let mut cases = Vec::new();
-    while let Some(item) = stream.recv().await {
-        cases.push(item.map_err(|error| error.to_string())?);
-    }
+    let cases = crate::config::testcase_fetcher()
+        .get_subproblem_testcases(problem_id, DEFAULT_SUBPROBLEM_ID)
+        .await
+        .map_err(|error| error.to_string())?;
     if cases.is_empty() {
         return Err("Testcases not found".into());
     }

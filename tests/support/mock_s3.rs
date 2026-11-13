@@ -20,6 +20,7 @@ const OBJECT_PATH: &str = "/testcases/1/1.pb.gz";
 
 pub struct MockS3 {
     endpoint: String,
+    head_requests: Arc<AtomicUsize>,
     downloads: Arc<AtomicUsize>,
     task: JoinHandle<()>,
 }
@@ -28,19 +29,24 @@ impl MockS3 {
     pub async fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let head_requests = Arc::new(AtomicUsize::new(0));
         let downloads = Arc::new(AtomicUsize::new(0));
         let fixture = testcase_fixture();
         let task = tokio::spawn({
+            let head_requests = Arc::clone(&head_requests);
             let downloads = Arc::clone(&downloads);
             async move {
                 loop {
                     let (stream, _) = listener.accept().await.unwrap();
-                    handle_request(stream, &fixture, &downloads).await.unwrap();
+                    handle_request(stream, &fixture, &head_requests, &downloads)
+                        .await
+                        .unwrap();
                 }
             }
         });
         Self {
             endpoint,
+            head_requests,
             downloads,
             task,
         }
@@ -53,6 +59,10 @@ impl MockS3 {
             .env("RUSTFS_REGION", "us-east-1")
             .env("RUSTFS_ACCESS_KEY", "test-access-key")
             .env("RUSTFS_SECRET_KEY", "test-secret-key");
+    }
+
+    pub fn head_requests(&self) -> usize {
+        self.head_requests.load(Ordering::Relaxed)
     }
 
     pub fn downloads(&self) -> usize {
@@ -69,6 +79,7 @@ impl Drop for MockS3 {
 async fn handle_request(
     stream: TcpStream,
     fixture: &[u8],
+    head_requests: &AtomicUsize,
     downloads: &AtomicUsize,
 ) -> io::Result<()> {
     let mut stream = BufReader::new(stream);
@@ -97,7 +108,10 @@ async fn handle_request(
     }
 
     let (status, length, body) = match (method, path) {
-        (Some("HEAD"), Some(OBJECT_PATH)) => ("200 OK", fixture.len(), &[][..]),
+        (Some("HEAD"), Some(OBJECT_PATH)) => {
+            head_requests.fetch_add(1, Ordering::Relaxed);
+            ("200 OK", fixture.len(), &[][..])
+        }
         (Some("GET"), Some(OBJECT_PATH)) if matching_etag => {
             downloads.fetch_add(1, Ordering::Relaxed);
             ("200 OK", fixture.len(), fixture)

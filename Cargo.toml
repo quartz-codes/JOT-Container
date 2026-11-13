@@ -8,6 +8,7 @@ async-trait = "0.1.92"
 aws-sdk-s3 = "1.159.0"
 bytes = "1.12.1"
 flate2 = "1.1.10"
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 jot-proto = "1.0.9"
 lazy_static = "1.5.0"
 lru = "0.18.5"
