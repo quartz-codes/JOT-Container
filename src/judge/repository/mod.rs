@@ -1,6 +1,7 @@
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
+use tokio::task::JoinError;
 
 pub mod cache;
 mod in_flight;
@@ -37,6 +38,7 @@ pub trait Repository<T, E>: Sync {
 pub enum S3RepositoryRequestError<E> {
     DecodeError(E),
     RepositoryError(String),
+    TaskFailed(Arc<JoinError>),
 }
 
 impl<E: fmt::Display> fmt::Display for S3RepositoryRequestError<E> {
@@ -44,6 +46,7 @@ impl<E: fmt::Display> fmt::Display for S3RepositoryRequestError<E> {
         match self {
             Self::DecodeError(error) => write!(f, "S3 object decoding failed: {error}"),
             Self::RepositoryError(error) => f.write_str(error),
+            Self::TaskFailed(error) => write!(f, "Repository task failed: {error}"),
         }
     }
 }

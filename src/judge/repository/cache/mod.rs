@@ -52,27 +52,17 @@ where
             return Ok(value);
         }
 
+        let repository = Arc::clone(&self.repository);
+        let cache = Arc::clone(&self.cache);
+        let version = version.clone();
         self.requests
-            .run(version.clone(), || {
-                let repository = Arc::clone(&self.repository);
-                let cache = Arc::clone(&self.cache);
-                let version = version.clone();
-                async move {
-                    // Another request may have filled the cache before this job was registered.
-                    if let Some(value) = cache.get(&key) {
-                        return Ok(value);
-                    }
-                    let value = repository.fetch_version(&version).await?;
-                    cache.insert(key, value.clone());
-                    Ok(value)
-                }
+            .run(version.clone(), async move {
+                let value = repository.fetch_version(&version).await?;
+                cache.insert(key, value.clone());
+                Ok(value)
             })
             .await
-            .ok_or_else(|| {
-                S3RepositoryRequestError::RepositoryError(
-                    "Cache fill task ended without a result".into(),
-                )
-            })?
+            .map_err(S3RepositoryRequestError::TaskFailed)?
             .as_ref()
             .clone()
     }

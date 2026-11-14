@@ -6,7 +6,7 @@ use bytes::Bytes;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 use super::{ObjectVersion, Repository, S3RepositoryRequestError, in_flight::InFlight};
-use S3RepositoryRequestError::{DecodeError, RepositoryError};
+use S3RepositoryRequestError::{DecodeError, RepositoryError, TaskFailed};
 
 type DownloadResult<T, E> = Result<T, S3RepositoryRequestError<E>>;
 
@@ -109,16 +109,17 @@ where
 
     async fn fetch_version(&self, version: &ObjectVersion) -> DownloadResult<T, E> {
         self.downloads
-            .run(version.clone(), || {
+            .run(
+                version.clone(),
                 Self::download(
                     self.client.clone(),
-                    Arc::clone(&self.bucket),
+                    self.bucket.clone(),
                     version.clone(),
                     self.decode_fn,
-                )
-            })
+                ),
+            )
             .await
-            .ok_or_else(|| RepositoryError("S3 download task ended without a result".into()))?
+            .map_err(TaskFailed)?
             .as_ref()
             .clone()
     }
