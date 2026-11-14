@@ -7,6 +7,7 @@ pub mod compiler;
 pub mod executor;
 pub mod grader;
 pub mod job;
+pub mod repository;
 pub mod testcase;
 
 pub struct Problem {

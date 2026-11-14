@@ -1,18 +1,24 @@
 use async_trait::async_trait;
-use std::sync::Arc;
 
+#[derive(Clone, prost::Message)]
 pub struct Testcase {
-    pub input: String,
-    pub answer: String,
+    #[prost(bytes = "bytes", tag = "1")]
+    pub input: bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub answer: bytes::Bytes,
 }
 
 pub type Testcases = Vec<Testcase>;
-pub type FetchResult = Result<Option<Arc<Testcases>>, String>;
 
 #[async_trait]
-pub trait TestcaseFetcher {
-    fn preload(&self, id: i64);
-    async fn get(&self, id: i64) -> FetchResult;
+pub trait TestcasesFetcher {
+    async fn get_subproblem_testcases(
+        &self,
+        problem_id: i64,
+        subproblem_id: i64,
+    ) -> Result<Testcases, TestcaseFetchError>;
 }
 
-pub mod lru_fetcher;
+pub type TestcaseFetchError = crate::judge::repository::S3RepositoryRequestError<String>;
+
+pub mod s3_fetcher;
