@@ -52,8 +52,8 @@ where
             return Ok(value);
         }
 
-        let repository = Arc::clone(&self.repository);
-        let cache = Arc::clone(&self.cache);
+        let repository = self.repository.clone();
+        let cache = self.cache.clone();
         let version = version.clone();
         self.requests
             .run(version.clone(), async move {
