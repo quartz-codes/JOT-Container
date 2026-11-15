@@ -71,10 +71,6 @@ fn decode_testcase_chunks(
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-
-    use flate2::{Compression, write::GzEncoder};
-
     use super::*;
 
     fn decode_chunks(compressed: &[u8]) -> Result<Testcases, String> {
@@ -88,19 +84,14 @@ mod tests {
 
     #[test]
     fn decodes_gzipped_protobuf_pairs_in_order() {
-        let protobuf = b"\x0a\x06\x0a\x01\xff\x12\x01\x00\x0a\x06\x0a\x01\x02\x12\x01\x03";
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(protobuf).unwrap();
-        let mut compressed = encoder.finish().unwrap();
-
-        let cases = decode_chunks(&compressed).unwrap();
+        let compressed = include_bytes!("../../../fixtures/aplusb_testcases.pb.gz");
+        let cases = decode_chunks(compressed).unwrap();
         assert_eq!(cases.len(), 2);
-        assert_eq!(&cases[0].input[..], &[0xff]);
-        assert_eq!(&cases[0].answer[..], &[0x00]);
-        assert_eq!(&cases[1].input[..], &[0x02]);
-        assert_eq!(&cases[1].answer[..], &[0x03]);
+        assert_eq!(&cases[0].input[..], b"1 2");
+        assert_eq!(&cases[0].answer[..], b"3");
+        assert_eq!(&cases[1].input[..], b"100 200");
+        assert_eq!(&cases[1].answer[..], b"300");
 
-        compressed.pop();
-        assert!(decode_chunks(&compressed).is_err());
+        assert!(decode_chunks(&compressed[..compressed.len() - 1]).is_err());
     }
 }

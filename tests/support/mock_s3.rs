@@ -1,13 +1,11 @@
 use std::{
-    io::{self, Write},
+    io,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
 };
 
-use flate2::{Compression, write::GzEncoder};
-use prost::Message;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
@@ -17,6 +15,7 @@ use tokio::{
 
 const ETAG: &str = "\"testcase-fixture-v1\"";
 const OBJECT_PATH: &str = "/testcases/1/1.pb.gz";
+const FIXTURE: &[u8] = include_bytes!("../../fixtures/aplusb_testcases.pb.gz");
 
 pub struct MockS3 {
     endpoint: String,
@@ -31,14 +30,13 @@ impl MockS3 {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let head_requests = Arc::new(AtomicUsize::new(0));
         let downloads = Arc::new(AtomicUsize::new(0));
-        let fixture = testcase_fixture();
         let task = tokio::spawn({
             let head_requests = Arc::clone(&head_requests);
             let downloads = Arc::clone(&downloads);
             async move {
                 loop {
                     let (stream, _) = listener.accept().await.unwrap();
-                    handle_request(stream, &fixture, &head_requests, &downloads)
+                    handle_request(stream, &head_requests, &downloads)
                         .await
                         .unwrap();
                 }
@@ -54,11 +52,11 @@ impl MockS3 {
 
     pub fn configure(&self, command: &mut Command) {
         command
-            .env("RUSTFS_ENDPOINT", &self.endpoint)
-            .env("RUSTFS_BUCKET", "testcases")
-            .env("RUSTFS_REGION", "us-east-1")
-            .env("RUSTFS_ACCESS_KEY", "test-access-key")
-            .env("RUSTFS_SECRET_KEY", "test-secret-key");
+            .env("S3_ENDPOINT", &self.endpoint)
+            .env("S3_BUCKET", "testcases")
+            .env("S3_REGION", "us-east-1")
+            .env("S3_ACCESS_KEY", "test-access-key")
+            .env("S3_SECRET_KEY", "test-secret-key");
     }
 
     pub fn head_requests(&self) -> usize {
@@ -78,7 +76,6 @@ impl Drop for MockS3 {
 
 async fn handle_request(
     stream: TcpStream,
-    fixture: &[u8],
     head_requests: &AtomicUsize,
     downloads: &AtomicUsize,
 ) -> io::Result<()> {
@@ -110,11 +107,11 @@ async fn handle_request(
     let (status, length, body) = match (method, path) {
         (Some("HEAD"), Some(OBJECT_PATH)) => {
             head_requests.fetch_add(1, Ordering::Relaxed);
-            ("200 OK", fixture.len(), &[][..])
+            ("200 OK", FIXTURE.len(), &[][..])
         }
         (Some("GET"), Some(OBJECT_PATH)) if matching_etag => {
             downloads.fetch_add(1, Ordering::Relaxed);
-            ("200 OK", fixture.len(), fixture)
+            ("200 OK", FIXTURE.len(), FIXTURE)
         }
         (Some("GET"), Some(OBJECT_PATH)) => ("412 Precondition Failed", 0, &[][..]),
         _ => ("404 Not Found", 0, &[][..]),
@@ -126,36 +123,4 @@ async fn handle_request(
     stream.write_all(headers.as_bytes()).await?;
     stream.write_all(body).await?;
     stream.shutdown().await
-}
-
-#[derive(Message)]
-struct TestcaseFile {
-    #[prost(message, repeated, tag = "1")]
-    cases: Vec<Testcase>,
-}
-
-#[derive(Message)]
-struct Testcase {
-    #[prost(bytes = "vec", tag = "1")]
-    input: Vec<u8>,
-    #[prost(bytes = "vec", tag = "2")]
-    answer: Vec<u8>,
-}
-
-fn testcase_fixture() -> Vec<u8> {
-    let file = TestcaseFile {
-        cases: vec![
-            Testcase {
-                input: b"1 2\n".to_vec(),
-                answer: b"3\n".to_vec(),
-            },
-            Testcase {
-                input: b"100 200\n".to_vec(),
-                answer: b"300\n".to_vec(),
-            },
-        ],
-    };
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(&file.encode_to_vec()).unwrap();
-    encoder.finish().unwrap()
 }
