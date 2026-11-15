@@ -4,7 +4,7 @@ use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 
 use crate::judge::testcase::s3_fetcher::S3TestcaseFetcher;
 
-struct RustFsConfig {
+struct S3Config {
     endpoint: String,
     bucket: String,
     region: String,
@@ -12,25 +12,25 @@ struct RustFsConfig {
     secret_key: String,
 }
 
-impl RustFsConfig {
+impl S3Config {
     fn load_from_env() -> Result<Self, String> {
         let required = |name| match env::var(name) {
             Ok(value) if !value.trim().is_empty() => Ok(value),
             Ok(_) => Err(format!("{name} must not be empty")),
             Err(error) => Err(format!("{name}: {error}")),
         };
-        let region = match env::var("RUSTFS_REGION") {
+        let region = match env::var("S3_REGION") {
             Ok(region) if !region.trim().is_empty() => region,
-            Ok(_) => return Err("RUSTFS_REGION must not be empty".into()),
+            Ok(_) => return Err("S3_REGION must not be empty".into()),
             Err(env::VarError::NotPresent) => "us-east-1".into(),
-            Err(error) => return Err(format!("RUSTFS_REGION: {error}")),
+            Err(error) => return Err(format!("S3_REGION: {error}")),
         };
         Ok(Self {
-            endpoint: required("RUSTFS_ENDPOINT")?,
-            bucket: required("RUSTFS_BUCKET")?,
+            endpoint: required("S3_ENDPOINT")?,
+            bucket: required("S3_BUCKET")?,
             region,
-            access_key: required("RUSTFS_ACCESS_KEY")?,
-            secret_key: required("RUSTFS_SECRET_KEY")?,
+            access_key: required("S3_ACCESS_KEY")?,
+            secret_key: required("S3_SECRET_KEY")?,
         })
     }
 
@@ -44,7 +44,7 @@ impl RustFsConfig {
                 self.secret_key,
                 None,
                 None,
-                "rustfs",
+                "s3",
             ))
             .force_path_style(true)
             .build();
@@ -108,10 +108,10 @@ pub fn init_config() -> Result<(), String> {
         return Ok(());
     }
     let runtime = Config::load_from_env()?;
-    let rustfs = RustFsConfig::load_from_env()?;
+    let s3 = S3Config::load_from_env()?;
     CONFIG.get_or_init(|| AppConfig {
         runtime,
-        testcase_fetcher: rustfs.into_testcase_fetcher(),
+        testcase_fetcher: s3.into_testcase_fetcher(),
     });
     Ok(())
 }
