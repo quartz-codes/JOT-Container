@@ -1,8 +1,8 @@
-use std::{collections::HashMap, net::TcpListener, time::Duration};
+use std::{net::TcpListener, time::Duration};
 
 use jot_proto::judge::v1::{
     JudgeEvent, JudgeRequest, JudgeResult, Language, judge_event::Payload, judge_result::Verdict,
-    judge_service_client::JudgeServiceClient,
+    judge_service_client::JudgeServiceClient, subproblem_verdict::SubproblemVerdict,
 };
 use tokio::process::{Child, Command};
 use tonic::transport::{Channel, Endpoint};
@@ -97,7 +97,6 @@ fn terminal_result(events: &[JudgeEvent]) -> &JudgeResult {
                         | Payload::Compiling(_)
                         | Payload::TestcasesDownloading(_)
                         | Payload::Running(_)
-                        | Payload::Finishing(_)
                 )
             ),
             "only progress events may precede the terminal result: {event:?}"
@@ -140,10 +139,15 @@ fn assert_complete(events: &[JudgeEvent], subproblem_ids: &[i64]) {
     assert_eq!(progress, (0..=total_cases).collect::<Vec<_>>());
     match &terminal_result(events).verdict {
         Some(Verdict::Complete(complete)) => {
-            let expected: HashMap<_, _> = subproblem_ids.iter().map(|&id| (id, true)).collect();
-            assert_eq!(complete.subproblem_is_correct, expected);
-            assert!(complete.instruction_count > 0);
-            assert!(complete.memory_bytes > 0);
+            assert_eq!(complete.subproblem_verdicts.len(), subproblem_ids.len());
+            for id in subproblem_ids {
+                assert!(matches!(
+                    &complete.subproblem_verdicts[id].subproblem_verdict,
+                    Some(SubproblemVerdict::Correct(resources))
+                        if resources.max_instruction_count_used > 0
+                            && resources.max_memory_byte_used > 0
+                ));
+            }
         }
         verdict => panic!("expected complete verdict, got {verdict:?}"),
     }
@@ -174,16 +178,51 @@ async fn judge_rpc_stream_ends_with_a_terminal_result() {
 async fn judge_rpc_reports_incorrect_subproblems_in_the_complete_result() {
     let (mut server, mut client, _s3) = start_server().await;
     let mut request = request(7);
-    request.subproblem_ids = vec![7, 12];
+    request.subproblem_ids = vec![7, 12, 7];
     request.source_code = "#include <iostream>\nint main() { std::cout << \"wrong\\n\"; }".into();
 
     let events = judge_events(&mut client, request).await;
     match &terminal_result(&events).verdict {
         Some(Verdict::Complete(complete)) => {
-            assert_eq!(
-                complete.subproblem_is_correct,
-                HashMap::from([(7, false), (12, false)])
-            );
+            assert_eq!(complete.subproblem_verdicts.len(), 2);
+            for id in [7, 12] {
+                assert!(matches!(
+                    complete.subproblem_verdicts[&id].subproblem_verdict,
+                    Some(SubproblemVerdict::WrongAnswer(_))
+                ));
+            }
+        }
+        verdict => panic!("expected complete verdict, got {verdict:?}"),
+    }
+    server.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn judge_rpc_reports_time_limit_for_each_subproblem() {
+    let (mut server, mut client, _s3) = start_server().await;
+    let mut request = request(8);
+    request.subproblem_ids = vec![7, 12];
+    request.language = Language::C as i32;
+    request.source_code =
+        "int main(void) { volatile unsigned count = 0; for (;;) { ++count; } }".into();
+    let instruction_limit = 100_000;
+    request.instruction_count_limit = instruction_limit;
+
+    let events = judge_events(&mut client, request).await;
+    match &terminal_result(&events).verdict {
+        Some(Verdict::Complete(complete)) => {
+            assert_eq!(complete.subproblem_verdicts.len(), 2);
+            for id in [7, 12] {
+                let verdict = &complete.subproblem_verdicts[&id].subproblem_verdict;
+                assert!(
+                    matches!(
+                        verdict,
+                        Some(SubproblemVerdict::TimeLimitExceeded(limit))
+                            if limit.max_instruction_count == instruction_limit
+                    ),
+                    "unexpected verdict for subproblem {id}: {verdict:?}"
+                );
+            }
         }
         verdict => panic!("expected complete verdict, got {verdict:?}"),
     }

@@ -10,10 +10,13 @@ use crate::judge::{
     checker::lcmp_checker::LcmpChecker,
     compiler,
     executor::Executor,
-    grader::{GradeResult, GradeStreamData, Grader, Verdict},
+    grader::{GradeStreamData, Grader, SubproblemVerdict},
     testcase::{Testcases, TestcasesFetcher},
 };
-use jot_proto::judge::v1::{self as proto, JudgeEvent, judge_result::Verdict as JudgeVerdict};
+use jot_proto::judge::v1::{
+    self as proto, JudgeEvent, judge_result::Verdict as JudgeVerdict,
+    subproblem_verdict::SubproblemVerdict as ProtoSubproblemVerdict,
+};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -162,6 +165,7 @@ impl JudgeJob {
             }
         };
 
+        // Running 이벤트 발송
         let executor: Arc<dyn Executor> = Arc::from(compiler_result.executor);
         let total_cases = testcases_by_subproblem_id
             .values()
@@ -169,9 +173,9 @@ impl JudgeJob {
             .sum::<usize>() as u32;
         let mut complete = proto::JudgeComplete::default();
         let mut completed_cases = 0;
-        let mut execution_failure = None;
         self.send_running(completed_cases, total_cases).await?;
 
+        // 각 subproblem에 대해 grading 수행
         for &subproblem_id in &self.request.subproblem_ids {
             let Some(testcases) = testcases_by_subproblem_id.remove(&subproblem_id) else {
                 continue;
@@ -190,61 +194,33 @@ impl JudgeJob {
                 match stream.recv().await {
                     Some(GradeStreamData::Progress {
                         completed_cases: count,
-                        ..
                     }) => {
                         subproblem_completed_cases = count;
+                        // completed_cases와 subproblem_completed_cases를 합쳐서 전체 진행 상황을 업데이트
                         self.send_running(completed_cases + count, total_cases)
                             .await?;
                     }
                     Some(GradeStreamData::Result(result)) => break result,
-                    None => {
-                        break GradeResult {
-                            verdict: Verdict::SystemError(Some(format!(
-                                "Grading stream for subproblem {subproblem_id} closed without a result"
-                            ))),
-                            memory_used: 0,
-                            instruction_count: 0,
-                        };
-                    }
+                    None => break Err("Grading stream closed without a result".into()),
                 }
             };
 
             completed_cases += subproblem_completed_cases;
-            complete.memory_bytes = complete.memory_bytes.max(result.memory_used);
-            complete.instruction_count = complete.instruction_count.max(result.instruction_count);
-            let failure = match result.verdict {
-                Verdict::Accepted => {
-                    complete.subproblem_is_correct.insert(subproblem_id, true);
-                    continue;
-                }
-                Verdict::WrongAnswer => {
-                    complete.subproblem_is_correct.insert(subproblem_id, false);
-                    continue;
-                }
-                Verdict::TimeLimitExceeded(max_instruction_count) => {
-                    JudgeVerdict::TimeLimitExceeded(proto::JudgeTle {
-                        max_instruction_count,
-                    })
-                }
-                Verdict::MemoryLimitExceeded(max_memory_bytes) => {
-                    JudgeVerdict::MemoryLimitExceeded(proto::JudgeMle { max_memory_bytes })
-                }
-                Verdict::RuntimeError(reason) => {
-                    JudgeVerdict::RuntimeError(proto::JudgeRuntimeError {
-                        error_message: reason.unwrap_or_default(),
-                    })
-                }
-                Verdict::SystemError(reason) => {
-                    JudgeVerdict::SystemError(proto::JudgeSystemError {
-                        error_message: reason.unwrap_or_default(),
-                    })
+            let verdict = match result.and_then(encode_subproblem_verdict) {
+                Ok(verdict) => verdict,
+                Err(error) => {
+                    return self
+                        .send_result(JudgeVerdict::SystemError(proto::JudgeSystemError {
+                            error_message: format!("Subproblem {subproblem_id}: {error}"),
+                        }))
+                        .await;
                 }
             };
-            execution_failure.get_or_insert(failure);
+            complete.subproblem_verdicts.insert(subproblem_id, verdict);
         }
 
-        self.send_result(execution_failure.unwrap_or(JudgeVerdict::Complete(complete)))
-            .await
+        // 모든 subproblem에 대한 grading이 완료되었으므로 최종 결과를 전송
+        self.send_result(JudgeVerdict::Complete(complete)).await
     }
 
     async fn send_result(&self, verdict: JudgeVerdict) -> Result<(), Error> {
@@ -270,4 +246,36 @@ impl JudgeJob {
             .await?;
         Ok(())
     }
+}
+
+fn encode_subproblem_verdict(
+    verdict: SubproblemVerdict,
+) -> Result<proto::SubproblemVerdict, String> {
+    let verdict = match verdict {
+        SubproblemVerdict::Correct(resources) => {
+            ProtoSubproblemVerdict::Correct(proto::SubproblemCorrect {
+                max_memory_byte_used: i64::try_from(resources.memory_used)
+                    .map_err(|_| "Memory usage exceeds the int64 range")?,
+                max_instruction_count_used: i64::try_from(resources.instruction_count)
+                    .map_err(|_| "Instruction count exceeds the int64 range")?,
+            })
+        }
+        SubproblemVerdict::WrongAnswer => {
+            ProtoSubproblemVerdict::WrongAnswer(proto::SubproblemWrongAnswer {})
+        }
+        SubproblemVerdict::TimeLimitExceeded(max_instruction_count) => {
+            ProtoSubproblemVerdict::TimeLimitExceeded(proto::SubproblemTle {
+                max_instruction_count,
+            })
+        }
+        SubproblemVerdict::MemoryLimitExceeded(max_memory_bytes) => {
+            ProtoSubproblemVerdict::MemoryLimitExceeded(proto::SubproblemMle { max_memory_bytes })
+        }
+        SubproblemVerdict::RuntimeError(error_message) => {
+            ProtoSubproblemVerdict::RuntimeError(proto::SubproblemRuntimeError { error_message })
+        }
+    };
+    Ok(proto::SubproblemVerdict {
+        subproblem_verdict: Some(verdict),
+    })
 }
