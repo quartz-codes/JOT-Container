@@ -2,7 +2,7 @@ use super::{ExecuteError, ExecuteResult, Executor};
 use async_trait::async_trait;
 use lazy_static::lazy_static;
 use std::sync::Arc;
-use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder, Trap};
+use wasmtime::{Config, Engine, Linker, Module, ResourceLimiter, Store, Trap};
 use wasmtime_wasi::{HostMonotonicClock, HostWallClock, I32Exit};
 use wasmtime_wasi::{
     WasiCtx, WasiCtxView, WasiView,
@@ -57,13 +57,70 @@ impl WasmExecutor {
     }
 }
 
-struct MyState {
+struct MemoryCheckState {
     ctx: WasiP1Ctx,
-    limit: StoreLimits,
+    limit: MemoryLimiter,
 }
-impl WasiView for MyState {
+impl WasiView for MemoryCheckState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         self.ctx.ctx()
+    }
+}
+
+struct MemoryLimiter {
+    memory_limit: usize,
+    memory_limit_exceeded: bool,
+    memory_used: usize,
+    table_used: usize,
+}
+impl MemoryLimiter {
+    fn new(memory_limit: usize) -> Self {
+        Self {
+            memory_limit,
+            memory_limit_exceeded: false,
+            memory_used: 0,
+            table_used: 0,
+        }
+    }
+}
+impl ResourceLimiter for MemoryLimiter {
+    fn memory_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        // self.memory_used = current;
+        if self.table_used + desired > self.memory_limit {
+            self.memory_limit_exceeded = true;
+            return Err(wasmtime::Error::msg("Memory limit exceeded"));
+        }
+        self.memory_used = desired;
+        Ok(true)
+    }
+
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        // self.table_used = current * 4;
+        let desired_table_used = desired * 4;
+        if self.memory_used + desired_table_used > self.memory_limit {
+            self.memory_limit_exceeded = true;
+            return Err(wasmtime::Error::msg("Memory limit exceeded"));
+        }
+        self.table_used = desired_table_used;
+        Ok(true)
+    }
+
+    fn instances(&self) -> usize {
+        1
+    }
+
+    fn memories(&self) -> usize {
+        1
     }
 }
 
@@ -77,13 +134,7 @@ impl Executor for WasmExecutor {
     ) -> Result<ExecuteResult, ExecuteError> {
         let engine = self.engine.clone();
 
-        let limit = StoreLimitsBuilder::new()
-            .memory_size(memory_limit as usize)
-            .memories(1)
-            .instances(1)
-            .build();
-
-        let mut linker = Linker::<MyState>::new(&engine);
+        let mut linker = Linker::<MemoryCheckState>::new(&engine);
         if let Err(_) = wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |s| &mut s.ctx) {
             return Err(ExecuteError::RuntimeError {
                 reason: Some("add_to_linker_sync() failed".into()),
@@ -131,9 +182,9 @@ impl Executor for WasmExecutor {
 
         let mut store = Store::new(
             &engine,
-            MyState {
+            MemoryCheckState {
                 ctx: wasi,
-                limit: limit,
+                limit: MemoryLimiter::new(memory_limit as usize),
             },
         );
         store.limiter(|store| &mut store.limit);
@@ -154,12 +205,17 @@ impl Executor for WasmExecutor {
                 reason: Some("linker.module() failed".into()),
             })?;
 
-        let instance =
-            linker
-                .instantiate(&mut store, &module)
-                .map_err(|_| ExecuteError::RuntimeError {
-                    reason: Some("linker.instantiate() failed".into()),
-                })?;
+        let instance = match linker.instantiate(&mut store, &module) {
+            Ok(instance) => instance,
+            Err(_) if store.data().limit.memory_limit_exceeded => {
+                return Err(ExecuteError::MemoryLimitExceeded(memory_limit));
+            }
+            Err(e) => {
+                return Err(ExecuteError::RuntimeError {
+                    reason: Some(format!("linker.instantiate() failed: {}", e)),
+                });
+            }
+        };
 
         let default =
             instance
@@ -173,7 +229,7 @@ impl Executor for WasmExecutor {
                 reason: Some("default.typed() failed".into()),
             })?;
 
-        let (result, mut store) =
+        let (result, store) =
             tokio::task::spawn_blocking(move || (default.call(&mut store, ()), store))
                 .await
                 .map_err(|_| ExecuteError::RuntimeError {
@@ -191,18 +247,17 @@ impl Executor for WasmExecutor {
         match result {
             Ok(()) => Ok(ExecuteResult {
                 output: String::from_utf8_lossy(memory_output.contents().iter().as_slice()).into(),
-                memory_used: instance
-                    .get_memory(&mut store, "memory")
-                    .map(|m| m.size(&store) * m.page_size(&store))
-                    .unwrap_or(0),
+                memory_used: (store.data().limit.memory_used + store.data().limit.table_used)
+                    as u64,
                 instruction_count: initial_fuel - store.get_fuel().unwrap(),
             }),
+            Err(_) if store.data().limit.memory_limit_exceeded => {
+                return Err(ExecuteError::MemoryLimitExceeded(memory_limit));
+            }
             Err(e) => {
                 if e.root_cause().downcast_ref::<Trap>() == Some(&Trap::OutOfFuel) {
                     Err(ExecuteError::TimeLimitExceeded(time_limit))
-                }
-                // todo: MLE
-                else {
+                } else {
                     Err(ExecuteError::RuntimeError {
                         reason: Some(e.to_string()),
                     })
@@ -224,28 +279,20 @@ async fn test_wasm() {
     assert_eq!(res.output.trim(), "3");
 }
 #[tokio::test]
-#[should_panic]
 async fn test_wasm_tle() {
     let executor = WasmExecutor::new(
         include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/aplusb.wasm")).to_vec(),
     );
-    let res = executor
-        .execute("1 2", 1048576, 10)
-        .await
-        .expect("Runtime error");
-    assert_eq!(res.output.trim(), "3");
+    let result = executor.execute("1 2", 1048576, 10).await;
+    assert!(matches!(result, Err(ExecuteError::TimeLimitExceeded(_))));
 }
 #[tokio::test]
-#[should_panic]
 async fn test_wasm_mle() {
     let executor = WasmExecutor::new(
         include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/aplusb.wasm")).to_vec(),
     );
-    let res = executor
-        .execute("1 2", 1000, 100000)
-        .await
-        .expect("Runtime error");
-    assert_eq!(res.output.trim(), "3");
+    let result = executor.execute("1 2", 1000, 100000).await;
+    assert!(matches!(result, Err(ExecuteError::MemoryLimitExceeded(_))));
 }
 
 // poll_oneoff 를 disable 했기 때문에 이 fixture는 런타임 에러가 나야 함
