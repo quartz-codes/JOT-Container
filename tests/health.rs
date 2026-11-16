@@ -16,6 +16,11 @@ async fn health_check_reports_serving() {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_JOT-Container"));
     command
         .env("GRPC_ADDR", address.to_string())
+        .env("S3_ENDPOINT", "http://127.0.0.1:1")
+        .env("S3_BUCKET", "testcases")
+        .env("S3_REGION", "us-east-1")
+        .env("S3_ACCESS_KEY", "test-access-key")
+        .env("S3_SECRET_KEY", "test-secret-key")
         .kill_on_drop(true);
     let mut server = command.spawn().unwrap();
 

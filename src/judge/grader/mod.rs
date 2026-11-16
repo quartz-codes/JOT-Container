@@ -1,4 +1,7 @@
-use crate::judge::Problem;
+use tokio::sync::mpsc;
+
+use crate::judge::ProblemRuntimeLimits;
+use crate::judge::testcase::Testcases;
 
 use super::checker::Checker;
 use super::executor::{ExecuteError, ExecuteResult, Executor};
@@ -8,131 +11,106 @@ pub struct Grader<C: Checker, E: Executor> {
     pub executor: E,
 }
 
-#[derive(Debug)]
-pub enum Verdict {
-    Accepted,
+pub enum SubproblemVerdict {
+    Correct(UsedResources),
     WrongAnswer,
-    RuntimeError(Option<String>),
+    RuntimeError(String),
     TimeLimitExceeded(u64),
     MemoryLimitExceeded(u64),
-    SystemError(Option<String>),
 }
-#[derive(Debug)]
-pub struct GradeResult {
-    pub verdict: Verdict,
+
+pub type GraderResult = Result<SubproblemVerdict, String>;
+
+pub struct UsedResources {
     pub memory_used: u64,
     pub instruction_count: u64,
 }
 
-impl<C: Checker, E: Executor> Grader<C, E> {
+pub enum GradeStreamData {
+    Result(GraderResult),
+    Progress { completed_cases: u32 },
+}
+
+impl<C: Checker + 'static, E: Executor + 'static> Grader<C, E> {
     pub fn new(checker: C, executor: E) -> Self {
         Self { checker, executor }
     }
-    pub async fn grade(&self, problem: Problem) -> GradeResult {
-        let checker = &self.checker;
-        let executor = &self.executor;
+    pub fn grade_stream(
+        self,
+        testcases: Testcases,
+        problem_limits: ProblemRuntimeLimits,
+    ) -> mpsc::Receiver<GradeStreamData> {
+        let checker = self.checker;
+        let executor = self.executor;
+        let (tx, rx) = mpsc::channel(8);
 
-        let mut grade_result = GradeResult {
-            verdict: Verdict::SystemError(Some("Unknown error".to_string())),
-            memory_used: 0,
-            instruction_count: 0,
-        };
+        tokio::spawn(async move {
+            let result = 'grading: {
+                let mut used_resources = UsedResources {
+                    memory_used: 0,
+                    instruction_count: 0,
+                };
+                for (idx, testcase) in testcases.iter().enumerate() {
+                    let (Ok(input), Ok(answer)) = (
+                        std::str::from_utf8(&testcase.input),
+                        std::str::from_utf8(&testcase.answer),
+                    ) else {
+                        break 'grading Err(format!("Testcase {} contains invalid UTF-8", idx + 1));
+                    };
+                    let execution = executor
+                        .execute(
+                            input,
+                            problem_limits.memory_byte_limit,
+                            problem_limits.instruction_count_limit,
+                        )
+                        .await;
+                    let ExecuteResult {
+                        output,
+                        memory_used,
+                        instruction_count,
+                    } = match execution {
+                        Ok(result) => result,
+                        Err(ExecuteError::TimeLimitExceeded(limit)) => {
+                            break 'grading Ok(SubproblemVerdict::TimeLimitExceeded(limit));
+                        }
+                        Err(ExecuteError::MemoryLimitExceeded(limit)) => {
+                            break 'grading Ok(SubproblemVerdict::MemoryLimitExceeded(limit));
+                        }
+                        Err(ExecuteError::RuntimeError { reason }) => {
+                            let message = reason.unwrap_or_else(|| "Unknown runtime error".into());
+                            break 'grading Ok(SubproblemVerdict::RuntimeError(message));
+                        }
+                    };
 
-        for (_, test) in problem.tests.iter().enumerate() {
-            let res = executor
-                .execute(&test.input, problem.memory_limit, problem.instruction_limit)
-                .await;
-            match res {
-                Ok(ExecuteResult {
-                    output,
-                    memory_used,
-                    instruction_count,
-                }) => {
-                    grade_result.memory_used = grade_result.memory_used.max(memory_used);
-                    grade_result.instruction_count =
-                        grade_result.instruction_count.max(instruction_count);
+                    match checker.check(&output, answer).await {
+                        Ok(true) => {}
+                        Ok(false) => break 'grading Ok(SubproblemVerdict::WrongAnswer),
+                        Err(error) => {
+                            break 'grading Err(format!(
+                                "Checker failed for testcase {}: {error}",
+                                idx + 1
+                            ));
+                        }
+                    }
 
-                    if !checker.check(&output, &test.answer).await.unwrap_or(false) {
-                        grade_result.verdict = Verdict::WrongAnswer;
-                        return grade_result;
+                    used_resources.memory_used = used_resources.memory_used.max(memory_used);
+                    used_resources.instruction_count =
+                        used_resources.instruction_count.max(instruction_count);
+                    if tx
+                        .send(GradeStreamData::Progress {
+                            completed_cases: (idx + 1) as u32,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
                     }
                 }
-                Err(ExecuteError::TimeLimitExceeded(time)) => {
-                    grade_result.verdict = Verdict::TimeLimitExceeded(time);
-                    return grade_result;
-                }
-                Err(ExecuteError::MemoryLimitExceeded(memory)) => {
-                    grade_result.verdict = Verdict::MemoryLimitExceeded(memory);
-                    return grade_result;
-                }
-                Err(ExecuteError::RuntimeError { reason }) => {
-                    grade_result.verdict = Verdict::RuntimeError(reason);
-                    return grade_result;
-                }
-            }
-        }
+                Ok(SubproblemVerdict::Correct(used_resources))
+            };
+            let _ = tx.send(GradeStreamData::Result(result)).await;
+        });
 
-        grade_result.verdict = Verdict::Accepted;
-        grade_result
-    }
-}
-
-#[tokio::test]
-async fn test_grader() {
-    use super::checker::lcmp_checker::LcmpChecker;
-    use super::executor::aplusb_executor::APlusBExecutor;
-    use crate::judge::testcase::Testcase;
-    use std::sync::Arc;
-
-    let problem = Problem {
-        tests: Arc::new(vec![
-            Testcase {
-                input: "1 2".into(),
-                answer: "3".into(),
-            },
-            Testcase {
-                input: "100 200".into(),
-                answer: "300".into(),
-            },
-        ]),
-        memory_limit: 1024 * 1024,
-        instruction_limit: 100000000,
-    };
-
-    let grader = Grader::new(LcmpChecker, APlusBExecutor);
-    let result = grader.grade(problem).await;
-
-    assert_eq!(matches!(result.verdict, Verdict::Accepted), true);
-}
-
-#[tokio::test]
-async fn test_grader_instruction_limit() {
-    use super::checker::lcmp_checker::LcmpChecker;
-    use super::executor::aplusb_executor::APlusBExecutor;
-    use crate::judge::testcase::Testcase;
-    use std::sync::Arc;
-
-    let problem = Problem {
-        tests: Arc::new(vec![
-            Testcase {
-                input: "1 2".into(),
-                answer: "3".into(),
-            },
-            Testcase {
-                input: "100 200".into(),
-                answer: "300".into(),
-            },
-        ]),
-        memory_limit: 1024 * 1024,
-        instruction_limit: 1,
-    };
-
-    let grader = Grader::new(LcmpChecker, APlusBExecutor);
-    let result = grader.grade(problem).await;
-
-    if let Verdict::TimeLimitExceeded(_) = result.verdict {
-        return;
-    } else {
-        panic!("Expected TimeLimitExceeded, got {:?}", result.verdict);
+        rx
     }
 }

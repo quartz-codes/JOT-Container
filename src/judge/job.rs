@@ -1,19 +1,45 @@
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
+
+use futures_util::{TryStreamExt, stream::FuturesUnordered};
+
 use crate::judge::{
-    Problem,
+    ProblemRuntimeLimits,
     checker::lcmp_checker::LcmpChecker,
     compiler,
-    grader::{self, Grader},
-    testcase::{TestcaseFetcher, lru_fetcher::LruTestcaseFetcher},
+    executor::Executor,
+    grader::{GradeStreamData, Grader, SubproblemVerdict},
+    testcase::{Testcases, TestcasesFetcher},
 };
-use jot_proto::judge::v1::{self as proto, JudgeEvent, judge_result::Verdict};
-use lazy_static::lazy_static;
+use jot_proto::judge::v1::{
+    self as proto, JudgeEvent, judge_result::Verdict as JudgeVerdict,
+    subproblem_verdict::SubproblemVerdict as ProtoSubproblemVerdict,
+};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
-// 일단 임시로 static으로 해놨는데 나중에 config등을 이용해서 더 좋게 바꿀 수 있을 듯
-lazy_static! {
-    static ref TESTCASE_FETCHER: LruTestcaseFetcher = LruTestcaseFetcher::new();
+async fn fetch_subproblem_testcases(
+    problem_id: i64,
+    subproblem_id: i64,
+) -> Result<(i64, Testcases), String> {
+    let fetcher = crate::config::testcase_fetcher();
+
+    let testcases = fetcher
+        .get_subproblem_testcases(problem_id, subproblem_id)
+        .await
+        .map_err(|e| {
+            format!("Failed to fetch testcases for problem {problem_id}, subproblem {subproblem_id}: {e}")
+        })?;
+    if testcases.is_empty() {
+        return Err(format!(
+            "No testcases found for problem {problem_id}, subproblem {subproblem_id}"
+        ));
+    }
+    Ok((subproblem_id, testcases))
 }
+
 pub struct JudgeJob {
     request: jot_proto::judge::v1::JudgeRequest,
     response_channel: tokio::sync::mpsc::Sender<jot_proto::judge::v1::JudgeEvent>,
@@ -43,9 +69,6 @@ impl JudgeJob {
     }
 
     pub async fn run(self) -> Result<(), Error> {
-        // preload를 여기서 호출할 수 있음
-        // PROBLEM_FETCHER.preload(self.request.problem_id);
-
         // 컴파일 시작 이벤트 발송
         self.response_channel
             .send(JudgeEvent {
@@ -112,118 +135,147 @@ impl JudgeJob {
             }
         };
 
-        // 테스트 케이스 다운로드 시작 이벤트 발송
+        // Testcase 다운로드 시작
         self.response_channel
             .send(JudgeEvent {
                 request_id: self.request.request_id,
                 payload: Some(
-                    jot_proto::judge::v1::judge_event::Payload::FetchingTestCasesMetadata(
-                        proto::JudgeFetchingTestCasesMetadata {},
+                    jot_proto::judge::v1::judge_event::Payload::TestcasesDownloading(
+                        jot_proto::judge::v1::JudgeTestcasesDownloading {},
                     ),
                 ),
             })
             .await?;
-
-        let Ok(testcases) = TESTCASE_FETCHER.get(self.request.problem_id).await else {
-            let judge_result = jot_proto::judge::v1::JudgeResult {
-                verdict: Some(Verdict::SystemError(proto::JudgeSystemError {
-                    error_message: "Failed to fetch testcases".into(),
-                })),
-            };
-            let event = JudgeEvent {
-                request_id: self.request.request_id,
-                payload: Some(jot_proto::judge::v1::judge_event::Payload::Result(
-                    judge_result,
-                )),
-            };
-            self.response_channel.send(event).await?;
-            return Ok(());
-        };
-        let Some(testcases) = testcases else {
-            let judge_result = jot_proto::judge::v1::JudgeResult {
-                verdict: Some(Verdict::SystemError(proto::JudgeSystemError {
-                    error_message: "Testcases not found".into(),
-                })),
-            };
-            let event = JudgeEvent {
-                request_id: self.request.request_id,
-                payload: Some(jot_proto::judge::v1::judge_event::Payload::Result(
-                    judge_result,
-                )),
-            };
-            self.response_channel.send(event).await?;
-            return Ok(());
-        };
-
-        let total_cases = testcases.len() as u32;
-
-        // 실행 중 이벤트 발송
-        self.response_channel
-            .send(JudgeEvent {
-                request_id: self.request.request_id,
-                payload: Some(jot_proto::judge::v1::judge_event::Payload::Running(
-                    proto::JudgeRunning {
-                        completed_cases: 0,
-                        total_cases,
-                    },
-                )),
-            })
-            .await?;
-
-        // TODO: 테스트 케이스 적용 구현
-        // let _ = compiler_result
-        //     .executor
-        //     .execute("1 2", limits.memory_bytes, limits.instruction_count)
-        //     .await;
-
-        // todo: grader에 stream 기능 만들어야 함
-        let grader = Grader::new(LcmpChecker::new(), compiler_result.executor);
-
-        let grade_result = grader
-            .grade(Problem {
-                memory_limit: self.request.memory_bytes_limit,
-                instruction_limit: self.request.instruction_count_limit,
-                tests: testcases,
-            })
+        let problem_id = self.request.problem_id;
+        let subproblem_ids: HashSet<_> = self.request.subproblem_ids.iter().copied().collect();
+        let downloads = subproblem_ids
+            .into_iter()
+            .map(|subproblem_id| fetch_subproblem_testcases(problem_id, subproblem_id))
+            .collect::<FuturesUnordered<_>>()
+            .try_collect::<HashMap<i64, Testcases>>()
             .await;
-
-        let verdict = match grade_result.verdict {
-            grader::Verdict::Accepted => Verdict::Complete(proto::JudgeComplete {
-                correct_subproblems: total_cases,
-                total_subproblems: total_cases,
-                instruction_count: grade_result.instruction_count,
-                memory_bytes: grade_result.memory_used,
-            }),
-            grader::Verdict::WrongAnswer => Verdict::WrongAnswer(proto::JudgeWrongAnswer {
-                message: "Wrong answer".into(),
-            }),
-            grader::Verdict::TimeLimitExceeded(limit) => {
-                Verdict::TimeLimitExceeded(proto::JudgeTle {
-                    max_instruction_count: limit,
-                })
-            }
-            grader::Verdict::MemoryLimitExceeded(limit) => {
-                Verdict::MemoryLimitExceeded(proto::JudgeMle {
-                    max_memory_bytes: limit,
-                })
-            }
-            grader::Verdict::RuntimeError(error) | grader::Verdict::SystemError(error) => {
-                Verdict::SystemError(proto::JudgeSystemError {
-                    error_message: error.unwrap_or_else(|| "Unknown execution error".into()),
-                })
+        let mut testcases_by_subproblem_id = match downloads {
+            Ok(testcases) => testcases,
+            Err(error_message) => {
+                return self
+                    .send_result(JudgeVerdict::SystemError(proto::JudgeSystemError {
+                        error_message,
+                    }))
+                    .await;
             }
         };
 
-        let judge_result = proto::JudgeResult {
-            verdict: Some(verdict),
-        };
+        // Running 이벤트 발송
+        let executor: Arc<dyn Executor> = Arc::from(compiler_result.executor);
+        let total_cases = testcases_by_subproblem_id
+            .values()
+            .map(Vec::len)
+            .sum::<usize>() as u32;
+        let mut complete = proto::JudgeComplete::default();
+        let mut completed_cases = 0;
+        self.send_running(completed_cases, total_cases).await?;
+
+        // 각 subproblem에 대해 grading 수행
+        for &subproblem_id in &self.request.subproblem_ids {
+            let Some(testcases) = testcases_by_subproblem_id.remove(&subproblem_id) else {
+                continue;
+            };
+            let grader = Grader::new(LcmpChecker::new(), Arc::clone(&executor));
+            let mut stream = grader.grade_stream(
+                testcases,
+                ProblemRuntimeLimits {
+                    memory_byte_limit: self.request.memory_bytes_limit,
+                    instruction_count_limit: self.request.instruction_count_limit,
+                },
+            );
+
+            let mut subproblem_completed_cases = 0;
+            let result = loop {
+                match stream.recv().await {
+                    Some(GradeStreamData::Progress {
+                        completed_cases: count,
+                    }) => {
+                        subproblem_completed_cases = count;
+                        // completed_cases와 subproblem_completed_cases를 합쳐서 전체 진행 상황을 업데이트
+                        self.send_running(completed_cases + count, total_cases)
+                            .await?;
+                    }
+                    Some(GradeStreamData::Result(result)) => break result,
+                    None => break Err("Grading stream closed without a result".into()),
+                }
+            };
+
+            completed_cases += subproblem_completed_cases;
+            let verdict = match result.and_then(encode_subproblem_verdict) {
+                Ok(verdict) => verdict,
+                Err(error) => {
+                    return self
+                        .send_result(JudgeVerdict::SystemError(proto::JudgeSystemError {
+                            error_message: format!("Subproblem {subproblem_id}: {error}"),
+                        }))
+                        .await;
+                }
+            };
+            complete.subproblem_verdicts.insert(subproblem_id, verdict);
+        }
+
+        // 모든 subproblem에 대한 grading이 완료되었으므로 최종 결과를 전송
+        self.send_result(JudgeVerdict::Complete(complete)).await
+    }
+
+    async fn send_result(&self, verdict: JudgeVerdict) -> Result<(), Error> {
         let event = JudgeEvent {
             request_id: self.request.request_id,
-            payload: Some(jot_proto::judge::v1::judge_event::Payload::Result(
-                judge_result,
-            )),
+            payload: Some(proto::judge_event::Payload::Result(proto::JudgeResult {
+                verdict: Some(verdict),
+            })),
         };
         self.response_channel.send(event).await?;
         Ok(())
     }
+
+    async fn send_running(&self, completed_cases: u32, total_cases: u32) -> Result<(), Error> {
+        self.response_channel
+            .send(JudgeEvent {
+                request_id: self.request.request_id,
+                payload: Some(proto::judge_event::Payload::Running(proto::JudgeRunning {
+                    completed_cases,
+                    total_cases,
+                })),
+            })
+            .await?;
+        Ok(())
+    }
+}
+
+fn encode_subproblem_verdict(
+    verdict: SubproblemVerdict,
+) -> Result<proto::SubproblemVerdict, String> {
+    let verdict = match verdict {
+        SubproblemVerdict::Correct(resources) => {
+            ProtoSubproblemVerdict::Correct(proto::SubproblemCorrect {
+                max_memory_byte_used: i64::try_from(resources.memory_used)
+                    .map_err(|_| "Memory usage exceeds the int64 range")?,
+                max_instruction_count_used: i64::try_from(resources.instruction_count)
+                    .map_err(|_| "Instruction count exceeds the int64 range")?,
+            })
+        }
+        SubproblemVerdict::WrongAnswer => {
+            ProtoSubproblemVerdict::WrongAnswer(proto::SubproblemWrongAnswer {})
+        }
+        SubproblemVerdict::TimeLimitExceeded(max_instruction_count) => {
+            ProtoSubproblemVerdict::TimeLimitExceeded(proto::SubproblemTle {
+                max_instruction_count,
+            })
+        }
+        SubproblemVerdict::MemoryLimitExceeded(max_memory_bytes) => {
+            ProtoSubproblemVerdict::MemoryLimitExceeded(proto::SubproblemMle { max_memory_bytes })
+        }
+        SubproblemVerdict::RuntimeError(error_message) => {
+            ProtoSubproblemVerdict::RuntimeError(proto::SubproblemRuntimeError { error_message })
+        }
+    };
+    Ok(proto::SubproblemVerdict {
+        subproblem_verdict: Some(verdict),
+    })
 }
