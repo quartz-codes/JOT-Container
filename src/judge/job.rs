@@ -206,7 +206,7 @@ impl JudgeJob {
             };
 
             completed_cases += subproblem_completed_cases;
-            let verdict = match result.and_then(encode_subproblem_verdict) {
+            let verdict = match result {
                 Ok(verdict) => verdict,
                 Err(error) => {
                     return self
@@ -216,7 +216,9 @@ impl JudgeJob {
                         .await;
                 }
             };
-            complete.subproblem_verdicts.insert(subproblem_id, verdict);
+            complete
+                .subproblem_verdicts
+                .insert(subproblem_id, encode_subproblem_verdict(verdict));
         }
 
         // 모든 subproblem에 대한 grading이 완료되었으므로 최종 결과를 전송
@@ -248,16 +250,12 @@ impl JudgeJob {
     }
 }
 
-fn encode_subproblem_verdict(
-    verdict: SubproblemVerdict,
-) -> Result<proto::SubproblemVerdict, String> {
+fn encode_subproblem_verdict(verdict: SubproblemVerdict) -> proto::SubproblemVerdict {
     let verdict = match verdict {
         SubproblemVerdict::Correct(resources) => {
             ProtoSubproblemVerdict::Correct(proto::SubproblemCorrect {
-                max_memory_byte_used: i64::try_from(resources.memory_used)
-                    .map_err(|_| "Memory usage exceeds the int64 range")?,
-                max_instruction_count_used: i64::try_from(resources.instruction_count)
-                    .map_err(|_| "Instruction count exceeds the int64 range")?,
+                max_memory_byte_used: resources.memory_used,
+                max_instruction_count_used: resources.instruction_count,
             })
         }
         SubproblemVerdict::WrongAnswer => {
@@ -275,7 +273,7 @@ fn encode_subproblem_verdict(
             ProtoSubproblemVerdict::RuntimeError(proto::SubproblemRuntimeError { error_message })
         }
     };
-    Ok(proto::SubproblemVerdict {
+    proto::SubproblemVerdict {
         subproblem_verdict: Some(verdict),
-    })
+    }
 }
