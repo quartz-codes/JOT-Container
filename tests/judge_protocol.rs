@@ -1,4 +1,4 @@
-use std::{net::TcpListener, time::Duration};
+use std::{collections::HashMap, net::TcpListener, time::Duration};
 
 use jot_proto::judge::v1::{
     JudgeEvent, JudgeRequest, JudgeResult, Language, judge_event::Payload, judge_result::Verdict,
@@ -119,14 +119,14 @@ fn assert_compile_progress(events: &[JudgeEvent]) {
     assert!(matches!(events[1].payload, Some(Payload::Compiling(_))));
 }
 
-fn assert_complete(events: &[JudgeEvent], subproblems: u32) {
+fn assert_complete(events: &[JudgeEvent], subproblem_ids: &[i64]) {
     assert!(matches!(events[0].payload, Some(Payload::Received(_))));
     assert!(matches!(events[1].payload, Some(Payload::Compiling(_))));
     assert!(matches!(
         events[2].payload,
         Some(Payload::TestcasesDownloading(_))
     ));
-    let total_cases = subproblems * 2;
+    let total_cases = subproblem_ids.len() as u32 * 2;
     let progress: Vec<_> = events
         .iter()
         .filter_map(|event| match &event.payload {
@@ -140,8 +140,8 @@ fn assert_complete(events: &[JudgeEvent], subproblems: u32) {
     assert_eq!(progress, (0..=total_cases).collect::<Vec<_>>());
     match &terminal_result(events).verdict {
         Some(Verdict::Complete(complete)) => {
-            assert_eq!(complete.correct_subproblems, subproblems);
-            assert_eq!(complete.total_subproblems, subproblems);
+            let expected: HashMap<_, _> = subproblem_ids.iter().map(|&id| (id, true)).collect();
+            assert_eq!(complete.subproblem_is_correct, expected);
             assert!(complete.instruction_count > 0);
             assert!(complete.memory_bytes > 0);
         }
@@ -155,7 +155,7 @@ async fn judge_rpc_stream_ends_with_a_terminal_result() {
     for request_id in [1, 2] {
         let events = judge_events(&mut client, request(request_id)).await;
         assert!(events.iter().all(|event| event.request_id == request_id));
-        assert_complete(&events, 1);
+        assert_complete(&events, &[7]);
     }
     assert_eq!(
         s3.head_requests(),
@@ -167,6 +167,26 @@ async fn judge_rpc_stream_ends_with_a_terminal_result() {
         1,
         "requests for the same object version should reuse the cached testcases"
     );
+    server.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn judge_rpc_reports_incorrect_subproblems_in_the_complete_result() {
+    let (mut server, mut client, _s3) = start_server().await;
+    let mut request = request(7);
+    request.subproblem_ids = vec![7, 12];
+    request.source_code = "#include <iostream>\nint main() { std::cout << \"wrong\\n\"; }".into();
+
+    let events = judge_events(&mut client, request).await;
+    match &terminal_result(&events).verdict {
+        Some(Verdict::Complete(complete)) => {
+            assert_eq!(
+                complete.subproblem_is_correct,
+                HashMap::from([(7, false), (12, false)])
+            );
+        }
+        verdict => panic!("expected complete verdict, got {verdict:?}"),
+    }
     server.kill().await.unwrap();
 }
 
@@ -243,7 +263,7 @@ async fn judge_queue_streams_concurrent_requests_with_independent_terminal_resul
     while let Some(task) = tasks.join_next().await {
         let (request_id, events) = task.expect("judge request task failed");
         assert!(events.iter().all(|event| event.request_id == request_id));
-        assert_complete(&events, 2);
+        assert_complete(&events, &[7, 12]);
     }
     assert_eq!(
         s3.head_requests(),

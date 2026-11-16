@@ -22,7 +22,7 @@ cargo test
 | 파일 | 확인하는 동작 |
 | --- | --- |
 | [`health.rs`](health.rs) | 서버를 실행한 뒤 gRPC Health `Check` 요청을 보내 빈 서비스 이름에 대해 `SERVING`을 반환하는지 확인한다. |
-| [`judge_protocol.rs`](judge_protocol.rs) | 실제 서버에 `Judge` 요청을 보내 요청 ID, 최종 결과 수신 및 스트림의 정상 종료를 확인한다. |
+| [`judge_protocol.rs`](judge_protocol.rs) | 실제 서버에 `Judge` 요청을 보내 요청 ID, 서브문제별 정답 여부, 최종 결과 수신 및 스트림의 정상 종료를 확인한다. |
 
 ## 채점 프로토콜 테스트
 
