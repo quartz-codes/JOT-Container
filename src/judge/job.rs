@@ -167,10 +167,7 @@ impl JudgeJob {
             .values()
             .map(Vec::len)
             .sum::<usize>() as u32;
-        let mut complete = proto::JudgeComplete {
-            total_subproblems: testcases_by_subproblem_id.len() as u32,
-            ..Default::default()
-        };
+        let mut complete = proto::JudgeComplete::default();
         let mut completed_cases = 0;
         let mut execution_failure = None;
         self.send_running(completed_cases, total_cases).await?;
@@ -217,10 +214,13 @@ impl JudgeJob {
             complete.instruction_count = complete.instruction_count.max(result.instruction_count);
             let failure = match result.verdict {
                 Verdict::Accepted => {
-                    complete.correct_subproblems += 1;
+                    complete.subproblem_is_correct.insert(subproblem_id, true);
                     continue;
                 }
-                Verdict::WrongAnswer => continue,
+                Verdict::WrongAnswer => {
+                    complete.subproblem_is_correct.insert(subproblem_id, false);
+                    continue;
+                }
                 Verdict::TimeLimitExceeded(max_instruction_count) => {
                     JudgeVerdict::TimeLimitExceeded(proto::JudgeTle {
                         max_instruction_count,
