@@ -16,6 +16,7 @@ fn request(request_id: i64) -> JudgeRequest {
     JudgeRequest {
         request_id,
         problem_id: 1,
+        subproblem_ids: vec![7],
         language: Language::Cpp as i32,
         source_code: r#"#include <iostream>
 int main() {
@@ -94,7 +95,7 @@ fn terminal_result(events: &[JudgeEvent]) -> &JudgeResult {
                 Some(
                     Payload::Received(_)
                         | Payload::Compiling(_)
-                        | Payload::FetchingTestCasesMetadata(_)
+                        | Payload::TestcasesDownloading(_)
                         | Payload::Running(_)
                         | Payload::Finishing(_)
                 )
@@ -118,27 +119,29 @@ fn assert_compile_progress(events: &[JudgeEvent]) {
     assert!(matches!(events[1].payload, Some(Payload::Compiling(_))));
 }
 
-fn assert_complete(events: &[JudgeEvent]) {
-    // 기존에는 events.len()이 5인 것이 맞지만 스트리밍 기능이 추가되면서
-    // 이벤트 수가 항상 5가 아니게 되어 주석처리함
-    // assert_eq!(events.len(), 5, "unexpected event sequence: {events:?}");
+fn assert_complete(events: &[JudgeEvent], subproblems: u32) {
     assert!(matches!(events[0].payload, Some(Payload::Received(_))));
     assert!(matches!(events[1].payload, Some(Payload::Compiling(_))));
     assert!(matches!(
         events[2].payload,
-        Some(Payload::FetchingTestCasesMetadata(_))
+        Some(Payload::TestcasesDownloading(_))
     ));
-    match &events[3].payload {
-        Some(Payload::Running(running)) => {
-            assert_eq!(running.completed_cases, 0);
-            assert_eq!(running.total_cases, 2);
-        }
-        payload => panic!("expected running event, got {payload:?}"),
-    }
+    let total_cases = subproblems * 2;
+    let progress: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            Some(Payload::Running(running)) => {
+                assert_eq!(running.total_cases, total_cases);
+                Some(running.completed_cases)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(progress, (0..=total_cases).collect::<Vec<_>>());
     match &terminal_result(events).verdict {
         Some(Verdict::Complete(complete)) => {
-            assert_eq!(complete.correct_subproblems, 1);
-            assert_eq!(complete.total_subproblems, 1);
+            assert_eq!(complete.correct_subproblems, subproblems);
+            assert_eq!(complete.total_subproblems, subproblems);
             assert!(complete.instruction_count > 0);
             assert!(complete.memory_bytes > 0);
         }
@@ -152,7 +155,7 @@ async fn judge_rpc_stream_ends_with_a_terminal_result() {
     for request_id in [1, 2] {
         let events = judge_events(&mut client, request(request_id)).await;
         assert!(events.iter().all(|event| event.request_id == request_id));
-        assert_complete(&events);
+        assert_complete(&events, 1);
     }
     assert_eq!(
         s3.head_requests(),
@@ -164,6 +167,46 @@ async fn judge_rpc_stream_ends_with_a_terminal_result() {
         1,
         "requests for the same object version should reuse the cached testcases"
     );
+    server.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn judge_rpc_returns_system_error_when_testcase_download_fails() {
+    let (mut server, mut client, _s3) = start_server().await;
+    let mut request = request(5);
+    request.subproblem_ids = vec![7, 99];
+
+    let events = judge_events(&mut client, request).await;
+    assert!(events.iter().all(|event| event.request_id == 5));
+    assert_eq!(events.len(), 4);
+    assert!(matches!(
+        events[2].payload,
+        Some(Payload::TestcasesDownloading(_))
+    ));
+    match &terminal_result(&events).verdict {
+        Some(Verdict::SystemError(error)) => {
+            assert!(error.error_message.contains("problem 1, subproblem 99"));
+        }
+        verdict => panic!("expected system error, got {verdict:?}"),
+    }
+    server.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn judge_rpc_returns_system_error_for_an_empty_testcase_list() {
+    let (mut server, mut client, _s3) = start_server().await;
+    let mut request = request(6);
+    request.subproblem_ids = vec![7, 13];
+
+    let events = judge_events(&mut client, request).await;
+    assert_eq!(events.len(), 4);
+    match &terminal_result(&events).verdict {
+        Some(Verdict::SystemError(error)) => assert_eq!(
+            error.error_message,
+            "No testcases found for problem 1, subproblem 13"
+        ),
+        verdict => panic!("expected system error, got {verdict:?}"),
+    }
     server.kill().await.unwrap();
 }
 
@@ -191,23 +234,26 @@ async fn judge_queue_streams_concurrent_requests_with_independent_terminal_resul
     for request_id in 10..13 {
         let mut client = client.clone();
         tasks.spawn(async move {
-            (
-                request_id,
-                judge_events(&mut client, request(request_id)).await,
-            )
+            let mut request = request(request_id);
+            request.subproblem_ids = vec![12, 7, 12];
+            (request_id, judge_events(&mut client, request).await)
         });
     }
 
     while let Some(task) = tasks.join_next().await {
         let (request_id, events) = task.expect("judge request task failed");
         assert!(events.iter().all(|event| event.request_id == request_id));
-        assert_complete(&events);
+        assert_complete(&events, 2);
     }
-    assert_eq!(s3.head_requests(), 3, "expected one HEAD per request");
+    assert_eq!(
+        s3.head_requests(),
+        6,
+        "expected one HEAD per distinct subproblem per request"
+    );
     assert_eq!(
         s3.downloads(),
-        1,
-        "expected one GET for the same object version"
+        2,
+        "expected one GET per distinct object version"
     );
     server.kill().await.unwrap();
 }

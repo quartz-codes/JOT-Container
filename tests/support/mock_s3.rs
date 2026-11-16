@@ -14,8 +14,12 @@ use tokio::{
 };
 
 const ETAG: &str = "\"testcase-fixture-v1\"";
-const OBJECT_PATH: &str = "/testcases/1/1.pb.gz";
+const OBJECT_PATH: &str = "/testcases/1/7.pb.gz";
+const SECOND_OBJECT_PATH: &str = "/testcases/1/12.pb.gz";
 const FIXTURE: &[u8] = include_bytes!("../../fixtures/aplusb_testcases.pb.gz");
+// A gzip member containing the empty Protobuf message.
+const EMPTY_FIXTURE: &[u8] =
+    b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00";
 
 pub struct MockS3 {
     endpoint: String,
@@ -104,16 +108,21 @@ async fn handle_request(
         }
     }
 
-    let (status, length, body) = match (method, path) {
-        (Some("HEAD"), Some(OBJECT_PATH)) => {
+    let fixture = match path {
+        Some(OBJECT_PATH | SECOND_OBJECT_PATH) => Some(FIXTURE),
+        Some("/testcases/1/13.pb.gz") => Some(EMPTY_FIXTURE),
+        _ => None,
+    };
+    let (status, length, body) = match (method, fixture) {
+        (Some("HEAD"), Some(fixture)) => {
             head_requests.fetch_add(1, Ordering::Relaxed);
-            ("200 OK", FIXTURE.len(), &[][..])
+            ("200 OK", fixture.len(), &[][..])
         }
-        (Some("GET"), Some(OBJECT_PATH)) if matching_etag => {
+        (Some("GET"), Some(fixture)) if matching_etag => {
             downloads.fetch_add(1, Ordering::Relaxed);
-            ("200 OK", FIXTURE.len(), FIXTURE)
+            ("200 OK", fixture.len(), fixture)
         }
-        (Some("GET"), Some(OBJECT_PATH)) => ("412 Precondition Failed", 0, &[][..]),
+        (Some("GET"), Some(_)) => ("412 Precondition Failed", 0, &[][..]),
         _ => ("404 Not Found", 0, &[][..]),
     };
     let headers = format!(
