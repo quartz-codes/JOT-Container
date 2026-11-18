@@ -28,21 +28,6 @@ pub trait Executor: Send + Sync {
 }
 
 #[async_trait]
-impl<T> Executor for Box<T>
-where
-    T: Executor + ?Sized,
-{
-    async fn execute(
-        &self,
-        input: &str,
-        memory_limit: u64,
-        time_limit: u64,
-    ) -> Result<ExecuteResult, ExecuteError> {
-        (**self).execute(input, memory_limit, time_limit).await
-    }
-}
-
-#[async_trait]
 impl<T: Executor + ?Sized> Executor for Arc<T> {
     async fn execute(
         &self,

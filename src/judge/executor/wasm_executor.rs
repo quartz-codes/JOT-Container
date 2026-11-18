@@ -45,15 +45,54 @@ impl HostMonotonicClock for DeniedMonotonicClock {
 
 pub struct WasmExecutor {
     engine: Engine,
-    wasm: Vec<u8>,
+    linker: Linker<MemoryCheckState>,
+    module: Module,
 }
 
 impl WasmExecutor {
-    pub fn new(wasm: Vec<u8>) -> Self {
-        Self {
-            engine: WASMTIME_ENGINE.clone(),
-            wasm,
+    pub fn new(wasm: Vec<u8>) -> Result<Self, ExecuteError> {
+        let engine = WASMTIME_ENGINE.clone();
+
+        let module =
+            Module::new(&WASMTIME_ENGINE, &wasm).map_err(|_| ExecuteError::RuntimeError {
+                reason: Some("Failed to load wasm binary".into()),
+            })?;
+
+        let mut linker = Linker::<MemoryCheckState>::new(&engine);
+        if let Err(_) = wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |s| &mut s.ctx) {
+            return Err(ExecuteError::RuntimeError {
+                reason: Some("add_to_linker_sync() failed".into()),
+            });
         }
+
+        // shadow implementation of `poll_oneoff` to preventing sleeping
+        // it immediately traps the instance if it tries to call poll_oneoff
+        // it can prevent something like sleep() on <unistd.h>
+        // but it may have side effects about input/output
+        // currently our input stream immediately returns some value or EOF, so this works fine
+        linker.allow_shadowing(true);
+
+        linker
+            .func_wrap(
+                "wasi_snapshot_preview1",
+                "poll_oneoff",
+                |_in_ptr: i32,
+                 _out_ptr: i32,
+                 _nsubscriptions: i32,
+                 _nevents_ptr: i32|
+                 -> wasmtime::Result<i32> {
+                    Err(wasmtime::Error::msg("poll_oneoff is disabled"))
+                },
+            )
+            .map_err(|_| ExecuteError::RuntimeError {
+                reason: Some("linker.func_wrap() failed".into()),
+            })?;
+
+        Ok(Self {
+            engine,
+            linker,
+            module,
+        })
     }
 }
 
@@ -132,36 +171,6 @@ impl Executor for WasmExecutor {
         memory_limit: u64,
         time_limit: u64,
     ) -> Result<ExecuteResult, ExecuteError> {
-        let mut linker = Linker::<MemoryCheckState>::new(&self.engine);
-        if let Err(_) = wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |s| &mut s.ctx) {
-            return Err(ExecuteError::RuntimeError {
-                reason: Some("add_to_linker_sync() failed".into()),
-            });
-        }
-
-        // shadow implementation of `poll_oneoff` to preventing sleeping
-        // it immediately traps the instance if it tries to call poll_oneoff
-        // it can prevent something like sleep() on <unistd.h>
-        // but it may have side effects about input/output
-        // currently our input stream immediately returns some value or EOF, so this works fine
-        linker.allow_shadowing(true);
-
-        linker
-            .func_wrap(
-                "wasi_snapshot_preview1",
-                "poll_oneoff",
-                |_in_ptr: i32,
-                 _out_ptr: i32,
-                 _nsubscriptions: i32,
-                 _nevents_ptr: i32|
-                 -> wasmtime::Result<i32> {
-                    Err(wasmtime::Error::msg("poll_oneoff is disabled"))
-                },
-            )
-            .map_err(|_| ExecuteError::RuntimeError {
-                reason: Some("linker.func_wrap() failed".into()),
-            })?;
-
         let input = String::from(input);
 
         let memory_input = MemoryInputPipe::new(input);
@@ -194,17 +203,16 @@ impl Executor for WasmExecutor {
                 reason: Some("set_fuel() failed".into()),
             })?;
 
-        let module =
-            Module::new(&self.engine, &self.wasm).map_err(|_| ExecuteError::RuntimeError {
-                reason: Some("Failed to load wasm binary".into()),
-            })?;
-        linker
-            .module(&mut store, "", &module)
-            .map_err(|_| ExecuteError::RuntimeError {
-                reason: Some("linker.module() failed".into()),
-            })?;
+        // No Linker::module() registration is needed: instantiate() resolves imports,
+        // and we call the resulting instance's `_start` directly.
+        // https://docs.wasmtime.dev/api/wasmtime/struct.Linker.html#method.instantiate
+        // linker
+        //     .module(&mut store, "", &module)
+        //     .map_err(|_| ExecuteError::RuntimeError {
+        //         reason: Some("linker.module() failed".into()),
+        //     })?;
 
-        let instance = match linker.instantiate(&mut store, &module) {
+        let instance = match self.linker.instantiate(&mut store, &self.module) {
             Ok(instance) => instance,
             Err(_) if store.data().limit.memory_limit_exceeded => {
                 return Err(ExecuteError::MemoryLimitExceeded(memory_limit));
@@ -270,7 +278,8 @@ impl Executor for WasmExecutor {
 async fn test_wasm() {
     let executor = WasmExecutor::new(
         include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/aplusb.wasm")).to_vec(),
-    );
+    )
+    .expect("Failed to create WasmExecutor");
     let res = executor
         .execute("1 2", 1048576, 100000)
         .await
@@ -281,7 +290,8 @@ async fn test_wasm() {
 async fn test_wasm_tle() {
     let executor = WasmExecutor::new(
         include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/aplusb.wasm")).to_vec(),
-    );
+    )
+    .expect("Failed to create WasmExecutor");
     let result = executor.execute("1 2", 1048576, 10).await;
     assert!(matches!(result, Err(ExecuteError::TimeLimitExceeded(_))));
 }
@@ -289,7 +299,8 @@ async fn test_wasm_tle() {
 async fn test_wasm_mle() {
     let executor = WasmExecutor::new(
         include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/aplusb.wasm")).to_vec(),
-    );
+    )
+    .expect("Failed to create WasmExecutor");
     let result = executor.execute("1 2", 1000, 100000).await;
     assert!(matches!(result, Err(ExecuteError::MemoryLimitExceeded(_))));
 }
@@ -300,7 +311,8 @@ async fn test_wasm_mle() {
 async fn test_wasm_sleep() {
     let executor = WasmExecutor::new(
         include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/sleep.wasm")).to_vec(),
-    );
+    )
+    .expect("Failed to create WasmExecutor");
     executor
         .execute("", 100000000, 100000000)
         .await
@@ -325,7 +337,8 @@ async fn test_long_input_scanf() {
             "/fixtures/long_input_scanf_strip.wasm"
         ))
         .to_vec(),
-    );
+    )
+    .expect("Failed to create WasmExecutor");
     let input = generate_long_input();
     let result = executor
         .execute(&input, 100000000, 1000000000)
@@ -343,7 +356,8 @@ async fn test_long_input_cin() {
             "/fixtures/long_input_cin_strip.wasm"
         ))
         .to_vec(),
-    );
+    )
+    .expect("Failed to create WasmExecutor");
     let input = generate_long_input();
     let result = executor
         .execute(&input, 100000000, 1000000000)
