@@ -162,6 +162,13 @@ impl Executor for WasmExecutor {
                 reason: Some("linker.func_wrap() failed".into()),
             })?;
 
+        let module =
+            Module::new(&self.engine, &self.wasm).map_err(|_| ExecuteError::RuntimeError {
+                reason: Some("Failed to load wasm binary".into()),
+            })?;
+
+        let linker = linker;
+
         let input = String::from(input);
 
         let memory_input = MemoryInputPipe::new(input);
@@ -194,15 +201,11 @@ impl Executor for WasmExecutor {
                 reason: Some("set_fuel() failed".into()),
             })?;
 
-        let module =
-            Module::new(&self.engine, &self.wasm).map_err(|_| ExecuteError::RuntimeError {
-                reason: Some("Failed to load wasm binary".into()),
-            })?;
-        linker
-            .module(&mut store, "", &module)
-            .map_err(|_| ExecuteError::RuntimeError {
-                reason: Some("linker.module() failed".into()),
-            })?;
+        // linker
+        //     .module(&mut store, "", &module)
+        //     .map_err(|_| ExecuteError::RuntimeError {
+        //         reason: Some("linker.module() failed".into()),
+        //     })?;
 
         let instance = match linker.instantiate(&mut store, &module) {
             Ok(instance) => instance,
