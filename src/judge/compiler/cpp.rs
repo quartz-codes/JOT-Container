@@ -39,7 +39,9 @@ impl Compiler for CppCompiler {
 
         let result = compile_executor.execute(source, limits).await?;
         Ok(CompilerResult {
-            executor: Box::new(WasmExecutor::new(result.output)),
+            executor: Box::new(WasmExecutor::new(result.output).map_err(|e| {
+                CompilerError::CompilationError(format!("Failed to create WasmExecutor: {:?}", e))
+            })?),
         })
     }
 }
