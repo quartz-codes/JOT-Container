@@ -16,7 +16,12 @@ impl LcmpChecker {
 
 #[async_trait]
 impl Checker for LcmpChecker {
-    async fn check(&self, output: &str, answer: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    async fn check(
+        &self,
+        _input: &str,
+        output: &str,
+        answer: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
         let output = output.split('\n');
         let answer = answer.split('\n');
 
@@ -46,7 +51,10 @@ mod tests {
 
     async fn check(output: &str, answer: &str) -> bool {
         let checker: Box<dyn Checker> = Box::new(LcmpChecker::new());
-        let res = checker.check(output, answer).await.expect("Checker error");
+        let res = checker
+            .check("", output, answer)
+            .await
+            .expect("Checker error");
         return res;
     }
 

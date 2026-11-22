@@ -82,7 +82,7 @@ impl<C: Checker + 'static, E: Executor + 'static> Grader<C, E> {
                         }
                     };
 
-                    match checker.check(&output, answer).await {
+                    match checker.check(&input, &output, answer).await {
                         Ok(true) => {}
                         Ok(false) => break 'grading Ok(SubproblemVerdict::WrongAnswer),
                         Err(error) => {
