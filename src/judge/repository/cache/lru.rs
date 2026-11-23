@@ -12,7 +12,7 @@ pub struct Lru<T> {
     A concurrent map like scc::HashMap synchronizes entry access. The global
     recency order and capacity limit would still need coordination.
     */
-    entries: Mutex<LruCache<String, T>>,
+    entries: Mutex<LruCache<(i64, i64), T>>,
 }
 
 impl<T> Lru<T> {
@@ -24,11 +24,11 @@ impl<T> Lru<T> {
 }
 
 impl<T: Clone + Send> Cache<T> for Lru<T> {
-    fn get(&self, key: &str) -> Option<T> {
+    fn get(&self, key: &(i64, i64)) -> Option<T> {
         self.entries.lock().unwrap().get(key).cloned()
     }
 
-    fn insert(&self, key: String, value: T) {
+    fn insert(&self, key: (i64, i64), value: T) {
         self.entries.lock().unwrap().put(key, value);
     }
 }
@@ -40,13 +40,13 @@ mod tests {
     #[test]
     fn accessing_an_entry_protects_it_from_the_next_eviction() {
         let cache = Lru::new(NonZeroUsize::new(2).unwrap());
-        cache.insert("first".into(), 1);
-        cache.insert("second".into(), 2);
-        assert_eq!(cache.get("first"), Some(1));
-        cache.insert("third".into(), 3);
+        cache.insert((1, 7), 1);
+        cache.insert((1, 12), 2);
+        assert_eq!(cache.get(&(1, 7)), Some(1));
+        cache.insert((2, 7), 3);
 
-        assert_eq!(cache.get("second"), None);
-        assert_eq!(cache.get("first"), Some(1));
-        assert_eq!(cache.get("third"), Some(3));
+        assert_eq!(cache.get(&(1, 12)), None);
+        assert_eq!(cache.get(&(1, 7)), Some(1));
+        assert_eq!(cache.get(&(2, 7)), Some(3));
     }
 }

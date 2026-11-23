@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use futures_util::{TryStreamExt, stream::FuturesUnordered};
 
@@ -19,12 +16,13 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
 async fn fetch_subproblem_testcases(
     problem_id: i64,
-    subproblem_id: i64,
+    subproblem: &jot_proto::Subproblem,
 ) -> Result<(i64, Testcases), String> {
+    let subproblem_id = subproblem.subproblem_id;
     let fetcher = crate::config::testcase_fetcher();
 
     let testcases = fetcher
-        .get_subproblem_testcases(problem_id, subproblem_id)
+        .get_subproblem_testcases(problem_id, subproblem_id, &subproblem.testcase_url)
         .await
         .map_err(|e| {
             format!("Failed to fetch testcases for problem {problem_id}, subproblem {subproblem_id}: {e}")
@@ -136,10 +134,11 @@ impl JudgeJob {
             })
             .await?;
         let problem_id = self.request.problem_id;
-        let subproblem_ids: HashSet<_> = self.request.subproblem_ids.iter().copied().collect();
-        let downloads = subproblem_ids
-            .into_iter()
-            .map(|subproblem_id| fetch_subproblem_testcases(problem_id, subproblem_id))
+        let downloads = self
+            .request
+            .subproblems
+            .values()
+            .map(|subproblem| fetch_subproblem_testcases(problem_id, subproblem))
             .collect::<FuturesUnordered<_>>()
             .try_collect::<HashMap<i64, Testcases>>()
             .await;
@@ -165,7 +164,8 @@ impl JudgeJob {
         self.send_running(completed_cases, total_cases).await?;
 
         // 각 subproblem에 대해 grading 수행
-        for &subproblem_id in &self.request.subproblem_ids {
+        for subproblem in self.request.subproblems.values() {
+            let subproblem_id = subproblem.subproblem_id;
             let Some(testcases) = testcases_by_subproblem_id.remove(&subproblem_id) else {
                 continue;
             };

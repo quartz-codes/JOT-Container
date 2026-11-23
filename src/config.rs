@@ -1,56 +1,6 @@
 use std::{env, net::SocketAddr, sync::OnceLock};
 
-use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
-
-use crate::judge::testcase::s3_fetcher::S3TestcaseFetcher;
-
-struct S3Config {
-    endpoint: String,
-    bucket: String,
-    region: String,
-    access_key: String,
-    secret_key: String,
-}
-
-impl S3Config {
-    fn load_from_env() -> Result<Self, String> {
-        let required = |name| match env::var(name) {
-            Ok(value) if !value.trim().is_empty() => Ok(value),
-            Ok(_) => Err(format!("{name} must not be empty")),
-            Err(error) => Err(format!("{name}: {error}")),
-        };
-        let region = match env::var("S3_REGION") {
-            Ok(region) if !region.trim().is_empty() => region,
-            Ok(_) => return Err("S3_REGION must not be empty".into()),
-            Err(env::VarError::NotPresent) => "us-east-1".into(),
-            Err(error) => return Err(format!("S3_REGION: {error}")),
-        };
-        Ok(Self {
-            endpoint: required("S3_ENDPOINT")?,
-            bucket: required("S3_BUCKET")?,
-            region,
-            access_key: required("S3_ACCESS_KEY")?,
-            secret_key: required("S3_SECRET_KEY")?,
-        })
-    }
-
-    fn into_testcase_fetcher(self) -> S3TestcaseFetcher {
-        let config = aws_sdk_s3::Config::builder()
-            .behavior_version(BehaviorVersion::latest())
-            .endpoint_url(self.endpoint)
-            .region(Region::new(self.region))
-            .credentials_provider(Credentials::new(
-                self.access_key,
-                self.secret_key,
-                None,
-                None,
-                "s3",
-            ))
-            .force_path_style(true)
-            .build();
-        S3TestcaseFetcher::new(aws_sdk_s3::Client::from_conf(config), self.bucket)
-    }
-}
+use crate::judge::testcase::http_fetcher::HttpTestcaseFetcher;
 
 #[derive(Debug)]
 struct Config {
@@ -98,7 +48,7 @@ impl Config {
 
 struct AppConfig {
     runtime: Config,
-    testcase_fetcher: S3TestcaseFetcher,
+    testcase_fetcher: HttpTestcaseFetcher,
 }
 
 static CONFIG: OnceLock<AppConfig> = OnceLock::new();
@@ -108,10 +58,9 @@ pub fn init_config() -> Result<(), String> {
         return Ok(());
     }
     let runtime = Config::load_from_env()?;
-    let s3 = S3Config::load_from_env()?;
     CONFIG.get_or_init(|| AppConfig {
         runtime,
-        testcase_fetcher: s3.into_testcase_fetcher(),
+        testcase_fetcher: HttpTestcaseFetcher::new(reqwest::Client::new()),
     });
     Ok(())
 }
@@ -122,7 +71,7 @@ fn app_config() -> &'static AppConfig {
         .expect("Call init_config() before using config")
 }
 
-pub fn testcase_fetcher() -> &'static S3TestcaseFetcher {
+pub fn testcase_fetcher() -> &'static HttpTestcaseFetcher {
     &app_config().testcase_fetcher
 }
 

@@ -10,21 +10,21 @@ use super::{TestcaseFetchError, Testcases, TestcasesFetcher};
 use crate::judge::repository::{
     Repository,
     cache::{CachedRepository, Lru},
-    s3_repository::S3Repository,
+    http_repository::HttpRepository,
 };
 
 const TESTCASE_CACHE_CAPACITY: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 
-pub struct S3TestcaseFetcher {
+pub struct HttpTestcaseFetcher {
     repository:
-        CachedRepository<S3Repository<Testcases, String>, Lru<Testcases>, Testcases, String>,
+        CachedRepository<HttpRepository<Testcases, String>, Lru<Testcases>, Testcases, String>,
 }
 
-impl S3TestcaseFetcher {
-    pub fn new(client: aws_sdk_s3::Client, bucket: String) -> Self {
+impl HttpTestcaseFetcher {
+    pub fn new(client: reqwest::Client) -> Self {
         Self {
             repository: CachedRepository::new(
-                S3Repository::new(client, bucket, decode_testcase_chunks),
+                HttpRepository::new(client, decode_testcase_chunks),
                 Lru::new(TESTCASE_CACHE_CAPACITY),
             ),
         }
@@ -32,14 +32,16 @@ impl S3TestcaseFetcher {
 }
 
 #[async_trait]
-impl TestcasesFetcher for S3TestcaseFetcher {
+impl TestcasesFetcher for HttpTestcaseFetcher {
     async fn get_subproblem_testcases(
         &self,
         problem_id: i64,
         subproblem_id: i64,
+        testcase_url: &str,
     ) -> Result<Testcases, TestcaseFetchError> {
-        let object_key = format!("{problem_id}/{subproblem_id}.pb.gz");
-        self.repository.fetch(&object_key).await
+        self.repository
+            .fetch((problem_id, subproblem_id), testcase_url)
+            .await
     }
 }
 
@@ -52,7 +54,7 @@ struct TestcaseFile {
 fn decode_testcase_chunks(
     mut receiver: mpsc::UnboundedReceiver<Bytes>,
 ) -> Result<Testcases, String> {
-    // S3Repository가 별도 블로킹 스레드에서 호출한다.
+    // HttpRepository가 별도 블로킹 스레드에서 호출한다.
     // 송신 채널이 닫힐 때까지 청크를 받은 순서대로 이어 붙인다.
     let mut compressed = Vec::new();
     while let Some(chunk) = receiver.blocking_recv() {

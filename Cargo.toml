@@ -5,14 +5,14 @@ edition = "2024"
 
 [dependencies]
 async-trait = "0.1.92"
-aws-sdk-s3 = "1.159.0"
 bytes = "1.12.1"
 flate2 = "1.1.10"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
-jot-proto = "1.0.17"
+jot-proto = "1.0.19"
 lazy_static = "1.5.0"
 lru = "0.18.5"
 prost = "0.14.4"
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
 scc = "3.8.8"
 tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "signal", "time"] }
 tokio-stream = "0.1.19"
@@ -21,4 +21,3 @@ tonic-health = "0.14.6"
 tonic-prost = "0.14.6"
 wasmtime = "49.0.1"
 wasmtime-wasi = { version = "49.0.1", features = ["p1"] }
-aws-types = "1.7.0"

@@ -16,9 +16,10 @@ pub trait TestcasesFetcher {
         &self,
         problem_id: i64,
         subproblem_id: i64,
+        testcase_url: &str,
     ) -> Result<Testcases, TestcaseFetchError>;
 }
 
-pub type TestcaseFetchError = crate::judge::repository::S3RepositoryRequestError<String>;
+pub type TestcaseFetchError = crate::judge::repository::HttpRepositoryRequestError<String>;
 
-pub mod s3_fetcher;
+pub mod http_fetcher;
