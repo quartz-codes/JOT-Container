@@ -1,22 +1,40 @@
 use std::{net::TcpListener, time::Duration};
 
 use jot_proto::judge::v1::{
-    JudgeEvent, JudgeRequest, JudgeResult, Language, judge_event::Payload, judge_result::Verdict,
-    judge_service_client::JudgeServiceClient, subproblem_verdict::SubproblemVerdict,
+    Checker, JudgeEvent, JudgeRequest, JudgeResult, Language, Subproblem, TestcaseOrigin,
+    judge_event::Payload, judge_result::Verdict, judge_service_client::JudgeServiceClient,
+    subproblem_verdict::SubproblemVerdict,
 };
 use tokio::process::{Child, Command};
 use tonic::transport::{Channel, Endpoint};
 
-#[path = "support/mock_s3.rs"]
-mod mock_s3;
+#[path = "support/mock_http.rs"]
+mod mock_http;
 
-use mock_s3::MockS3;
+use mock_http::MockHttp;
 
-fn request(request_id: i64) -> JudgeRequest {
+fn subproblems(http: &MockHttp, ids: &[i64]) -> std::collections::HashMap<i64, Subproblem> {
+    ids.iter()
+        .map(|&id| {
+            (
+                id,
+                Subproblem {
+                    subproblem_id: id,
+                    testcase_origin: TestcaseOrigin::Https as i32,
+                    testcase_url: http.url(id),
+                    checker: Checker::Lcmp as i32,
+                },
+            )
+        })
+        .collect()
+}
+
+fn request(request_id: i64, http: &MockHttp) -> JudgeRequest {
     JudgeRequest {
         request_id,
+        submission_id: request_id,
         problem_id: 1,
-        subproblem_ids: vec![7],
+        subproblems: subproblems(http, &[7]),
         language: Language::Cpp as i32,
         source_code: r#"#include <iostream>
 int main() {
@@ -33,14 +51,13 @@ int main() {
     }
 }
 
-async fn start_server() -> (Child, JudgeServiceClient<Channel>, MockS3) {
-    let s3 = MockS3::start().await;
+async fn start_server() -> (Child, JudgeServiceClient<Channel>, MockHttp) {
+    let http = MockHttp::start().await;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     drop(listener);
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_JOT-Container"));
-    s3.configure(&mut command);
     let mut server = command
         .env("GRPC_ADDR", address.to_string())
         .kill_on_drop(true)
@@ -63,7 +80,7 @@ async fn start_server() -> (Child, JudgeServiceClient<Channel>, MockS3) {
     })
     .await
     .expect("gRPC server did not start");
-    (server, JudgeServiceClient::new(channel), s3)
+    (server, JudgeServiceClient::new(channel), http)
 }
 
 async fn judge_events(
@@ -155,30 +172,35 @@ fn assert_complete(events: &[JudgeEvent], subproblem_ids: &[i64]) {
 
 #[tokio::test]
 async fn judge_rpc_stream_ends_with_a_terminal_result() {
-    let (mut server, mut client, s3) = start_server().await;
+    let (mut server, mut client, http) = start_server().await;
     for request_id in [1, 2] {
-        let events = judge_events(&mut client, request(request_id)).await;
+        let mut request = request(request_id, &http);
+        if request_id == 2 {
+            // A renewed URL must reuse the testcases cached by problem/subproblem ID.
+            request
+                .subproblems
+                .get_mut(&7)
+                .unwrap()
+                .testcase_url
+                .push_str("&renewed=1");
+        }
+        let events = judge_events(&mut client, request).await;
         assert!(events.iter().all(|event| event.request_id == request_id));
         assert_complete(&events, &[7]);
     }
     assert_eq!(
-        s3.head_requests(),
-        2,
-        "each judge request should look up the ETag only once"
-    );
-    assert_eq!(
-        s3.downloads(),
+        http.downloads(),
         1,
-        "requests for the same object version should reuse the cached testcases"
+        "requests for the same problem/subproblem pair should reuse the cached testcases"
     );
     server.kill().await.unwrap();
 }
 
 #[tokio::test]
 async fn judge_rpc_reports_incorrect_subproblems_in_the_complete_result() {
-    let (mut server, mut client, _s3) = start_server().await;
-    let mut request = request(7);
-    request.subproblem_ids = vec![7, 12, 7];
+    let (mut server, mut client, http) = start_server().await;
+    let mut request = request(7, &http);
+    request.subproblems = subproblems(&http, &[7, 12, 7]);
     request.source_code = "#include <iostream>\nint main() { std::cout << \"wrong\\n\"; }".into();
 
     let events = judge_events(&mut client, request).await;
@@ -199,9 +221,9 @@ async fn judge_rpc_reports_incorrect_subproblems_in_the_complete_result() {
 
 #[tokio::test]
 async fn judge_rpc_reports_time_limit_for_each_subproblem() {
-    let (mut server, mut client, _s3) = start_server().await;
-    let mut request = request(8);
-    request.subproblem_ids = vec![7, 12];
+    let (mut server, mut client, http) = start_server().await;
+    let mut request = request(8, &http);
+    request.subproblems = subproblems(&http, &[7, 12]);
     request.language = Language::C as i32;
     request.source_code =
         "int main(void) { volatile unsigned count = 0; for (;;) { ++count; } }".into();
@@ -231,9 +253,9 @@ async fn judge_rpc_reports_time_limit_for_each_subproblem() {
 
 #[tokio::test]
 async fn judge_rpc_returns_system_error_when_testcase_download_fails() {
-    let (mut server, mut client, _s3) = start_server().await;
-    let mut request = request(5);
-    request.subproblem_ids = vec![7, 99];
+    let (mut server, mut client, http) = start_server().await;
+    let mut request = request(5, &http);
+    request.subproblems = subproblems(&http, &[7, 99]);
 
     let events = judge_events(&mut client, request).await;
     assert!(events.iter().all(|event| event.request_id == 5));
@@ -253,9 +275,9 @@ async fn judge_rpc_returns_system_error_when_testcase_download_fails() {
 
 #[tokio::test]
 async fn judge_rpc_returns_system_error_for_an_empty_testcase_list() {
-    let (mut server, mut client, _s3) = start_server().await;
-    let mut request = request(6);
-    request.subproblem_ids = vec![7, 13];
+    let (mut server, mut client, http) = start_server().await;
+    let mut request = request(6, &http);
+    request.subproblems = subproblems(&http, &[7, 13]);
 
     let events = judge_events(&mut client, request).await;
     assert_eq!(events.len(), 4);
@@ -271,8 +293,8 @@ async fn judge_rpc_returns_system_error_for_an_empty_testcase_list() {
 
 #[tokio::test]
 async fn judge_rpc_stream_returns_compilation_error_as_terminal_result() {
-    let (mut server, mut client, _s3) = start_server().await;
-    let mut invalid_request = request(2);
+    let (mut server, mut client, http) = start_server().await;
+    let mut invalid_request = request(2, &http);
     invalid_request.source_code = "this is not valid C++".into();
 
     let events = judge_events(&mut client, invalid_request).await;
@@ -287,16 +309,14 @@ async fn judge_rpc_stream_returns_compilation_error_as_terminal_result() {
 
 #[tokio::test]
 async fn judge_queue_streams_concurrent_requests_with_independent_terminal_results() {
-    let (mut server, client, s3) = start_server().await;
+    let (mut server, client, http) = start_server().await;
     let mut tasks = tokio::task::JoinSet::new();
 
     for request_id in 10..13 {
         let mut client = client.clone();
-        tasks.spawn(async move {
-            let mut request = request(request_id);
-            request.subproblem_ids = vec![12, 7, 12];
-            (request_id, judge_events(&mut client, request).await)
-        });
+        let mut request = request(request_id, &http);
+        request.subproblems = subproblems(&http, &[12, 7, 12]);
+        tasks.spawn(async move { (request_id, judge_events(&mut client, request).await) });
     }
 
     while let Some(task) = tasks.join_next().await {
@@ -305,22 +325,17 @@ async fn judge_queue_streams_concurrent_requests_with_independent_terminal_resul
         assert_complete(&events, &[7, 12]);
     }
     assert_eq!(
-        s3.head_requests(),
-        6,
-        "expected one HEAD per distinct subproblem per request"
-    );
-    assert_eq!(
-        s3.downloads(),
+        http.downloads(),
         2,
-        "expected one GET per distinct object version"
+        "expected one GET per distinct problem/subproblem pair"
     );
     server.kill().await.unwrap();
 }
 
 #[tokio::test]
 async fn judge_rpc_returns_compile_time_limit_with_requested_limit() {
-    let (mut server, mut client, _s3) = start_server().await;
-    let mut request = request(3);
+    let (mut server, mut client, http) = start_server().await;
+    let mut request = request(3, &http);
     request.compile_time_ms_limit = 0;
     let events = judge_events(&mut client, request).await;
     assert!(events.iter().all(|event| event.request_id == 3));
@@ -334,8 +349,8 @@ async fn judge_rpc_returns_compile_time_limit_with_requested_limit() {
 
 #[tokio::test]
 async fn judge_rpc_returns_compile_artifact_limit_with_requested_limit() {
-    let (mut server, mut client, _s3) = start_server().await;
-    let mut request = request(4);
+    let (mut server, mut client, http) = start_server().await;
+    let mut request = request(4, &http);
     request.build_artifact_bytes_limit = 1;
     let events = judge_events(&mut client, request).await;
     assert!(events.iter().all(|event| event.request_id == 4));
