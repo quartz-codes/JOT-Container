@@ -1,4 +1,5 @@
 pub mod lcmp_checker;
+pub mod testlib_checker;
 
 use async_trait::async_trait;
 

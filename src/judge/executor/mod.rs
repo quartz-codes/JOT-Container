@@ -1,15 +1,33 @@
 pub mod wasm_executor;
 
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ExecuteError {
     TimeLimitExceeded(u64),
     MemoryLimitExceeded(u64),
     RuntimeError { reason: Option<String> },
 }
+impl fmt::Display for ExecuteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExecuteError::TimeLimitExceeded(limit) => write!(f, "Time limit exceeded: {}", limit),
+            ExecuteError::MemoryLimitExceeded(limit) => {
+                write!(f, "Memory limit exceeded: {}", limit)
+            }
+            ExecuteError::RuntimeError { reason } => {
+                if let Some(r) = reason {
+                    write!(f, "Runtime error: {}", r)
+                } else {
+                    write!(f, "Runtime error")
+                }
+            }
+        }
+    }
+}
+impl std::error::Error for ExecuteError {}
 #[derive(Debug)]
 pub struct ExecuteResult {
     pub output: String,

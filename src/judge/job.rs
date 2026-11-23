@@ -7,9 +7,9 @@ use futures_util::{TryStreamExt, stream::FuturesUnordered};
 
 use crate::judge::{
     ProblemRuntimeLimits,
-    checker::lcmp_checker::LcmpChecker,
+    checker::{lcmp_checker::LcmpChecker, testlib_checker::TestlibChecker},
     compiler,
-    executor::Executor,
+    executor::{Executor, wasm_executor::WasmExecutor},
     grader::{GradeStreamData, Grader, SubproblemVerdict},
     testcase::{Testcases, TestcasesFetcher},
 };
@@ -169,7 +169,14 @@ impl JudgeJob {
             let Some(testcases) = testcases_by_subproblem_id.remove(&subproblem_id) else {
                 continue;
             };
-            let grader = Grader::new(LcmpChecker::new(), Arc::clone(&executor));
+            let a = 1;
+            let grader = Grader::new(
+                TestlibChecker::new(Box::new(WasmExecutor::new(
+                    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/lcmp.wasm"))
+                        .to_vec(),
+                )?)),
+                Arc::clone(&executor),
+            );
             let mut stream = grader.grade_stream(
                 testcases,
                 ProblemRuntimeLimits {

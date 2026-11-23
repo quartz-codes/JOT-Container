@@ -9,6 +9,7 @@ dependencies = [
  "async-trait",
  "aws-sdk-s3",
  "aws-types",
+ "base64 0.23.1",
  "bytes",
  "flate2",
  "futures-util",

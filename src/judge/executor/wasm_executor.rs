@@ -265,6 +265,14 @@ impl Executor for WasmExecutor {
                 if e.root_cause().downcast_ref::<Trap>() == Some(&Trap::OutOfFuel) {
                     Err(ExecuteError::TimeLimitExceeded(time_limit))
                 } else {
+                    println!(
+                        "stdout: {}",
+                        String::from_utf8_lossy(memory_output.contents().iter().as_slice())
+                    );
+                    println!(
+                        "stderr: {}",
+                        String::from_utf8_lossy(memory_error_output.contents().iter().as_slice())
+                    );
                     Err(ExecuteError::RuntimeError {
                         reason: Some(e.to_string()),
                     })
