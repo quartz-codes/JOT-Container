@@ -170,11 +170,20 @@ impl Executor for WasmExecutor {
         input: &str,
         memory_limit: u64,
         time_limit: u64,
+        output_limit: Option<usize>,
     ) -> Result<ExecuteResult, ExecuteError> {
         let input = String::from(input);
 
+        // MemoryOutputPipe does not make trap when output limit is exceeded when running on WASI p1
+        // This is temproral implementation, and it needs to be fixed in the future
+        let output_limit = if let Some(output_limit) = output_limit {
+            output_limit + 1
+        } else {
+            usize::MAX
+        };
+
         let memory_input = MemoryInputPipe::new(input);
-        let memory_output = Arc::new(MemoryOutputPipe::new(1048576));
+        let memory_output = Arc::new(MemoryOutputPipe::new(output_limit));
         let memory_error_output = Arc::new(MemoryOutputPipe::new(1048576));
 
         let wasi = WasiCtx::builder()
@@ -252,6 +261,9 @@ impl Executor for WasmExecutor {
         };
 
         match result {
+            Ok(()) if memory_output.contents().len() >= output_limit => {
+                Err(ExecuteError::OutputLimitExceeded(output_limit - 1))
+            }
             Ok(()) => Ok(ExecuteResult {
                 output: String::from_utf8_lossy(memory_output.contents().iter().as_slice()).into(),
                 memory_used: (store.data().limit.memory_used + store.data().limit.table_used)
@@ -281,7 +293,7 @@ async fn test_wasm() {
     )
     .expect("Failed to create WasmExecutor");
     let res = executor
-        .execute("1 2", 1048576, 100000)
+        .execute("1 2", 1048576, 100000, None)
         .await
         .expect("Runtime error");
     assert_eq!(res.output.trim(), "3");
@@ -292,7 +304,7 @@ async fn test_wasm_tle() {
         include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/aplusb.wasm")).to_vec(),
     )
     .expect("Failed to create WasmExecutor");
-    let result = executor.execute("1 2", 1048576, 10).await;
+    let result = executor.execute("1 2", 1048576, 10, None).await;
     assert!(matches!(result, Err(ExecuteError::TimeLimitExceeded(_))));
 }
 #[tokio::test]
@@ -301,7 +313,7 @@ async fn test_wasm_mle() {
         include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/aplusb.wasm")).to_vec(),
     )
     .expect("Failed to create WasmExecutor");
-    let result = executor.execute("1 2", 1000, 100000).await;
+    let result = executor.execute("1 2", 1000, 100000, None).await;
     assert!(matches!(result, Err(ExecuteError::MemoryLimitExceeded(_))));
 }
 
@@ -314,7 +326,7 @@ async fn test_wasm_sleep() {
     )
     .expect("Failed to create WasmExecutor");
     executor
-        .execute("", 100000000, 100000000)
+        .execute("", 100000000, 100000000, None)
         .await
         .expect("Runtime error");
 }
@@ -341,7 +353,7 @@ async fn test_long_input_scanf() {
     .expect("Failed to create WasmExecutor");
     let input = generate_long_input();
     let result = executor
-        .execute(&input, 100000000, 1000000000)
+        .execute(&input, 100000000, 1000000000, None)
         .await
         .expect("Runtime error");
 
@@ -360,9 +372,28 @@ async fn test_long_input_cin() {
     .expect("Failed to create WasmExecutor");
     let input = generate_long_input();
     let result = executor
-        .execute(&input, 100000000, 1000000000)
+        .execute(&input, 100000000, 1000000000, None)
         .await
         .expect("Runtime error");
 
     assert_eq!(result.output.trim(), input.trim());
+}
+
+#[tokio::test]
+#[should_panic = "WasmExecutor::execute() failed"]
+async fn test_wasm_output_limit() {
+    let executor = WasmExecutor::new(
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/fixtures/long_input_scanf_strip.wasm"
+        ))
+        .to_vec(),
+    )
+    .expect("Failed to create WasmExecutor");
+
+    let input = generate_long_input();
+    let _result = executor
+        .execute(&input, 100000000, 1000000000, Some(10))
+        .await
+        .expect("WasmExecutor::execute() failed");
 }

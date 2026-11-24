@@ -62,6 +62,7 @@ impl<C: Checker + 'static, E: Executor + 'static> Grader<C, E> {
                             input,
                             problem_limits.memory_byte_limit,
                             problem_limits.instruction_count_limit,
+                            Some(1048576.max(answer.len() * 2)),
                         )
                         .await;
                     let ExecuteResult {
@@ -75,6 +76,10 @@ impl<C: Checker + 'static, E: Executor + 'static> Grader<C, E> {
                         }
                         Err(ExecuteError::MemoryLimitExceeded(limit)) => {
                             break 'grading Ok(SubproblemVerdict::MemoryLimitExceeded(limit));
+                        }
+                        Err(ExecuteError::OutputLimitExceeded(_limit)) => {
+                            let message = "Output Limit Exceeded".into();
+                            break 'grading Ok(SubproblemVerdict::RuntimeError(message));
                         }
                         Err(ExecuteError::RuntimeError { reason }) => {
                             let message = reason.unwrap_or_else(|| "Unknown runtime error".into());
