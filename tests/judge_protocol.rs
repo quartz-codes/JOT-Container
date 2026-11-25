@@ -48,7 +48,7 @@ int main() {
         instruction_count_limit: 100_000_000,
         memory_bytes_limit: 64 * 1024 * 1024,
         build_artifact_bytes_limit: 16 * 1024 * 1024,
-        output_bytes_limit_multiplier: 2.0,
+        output_bytes_limit_multiplier: 200.0,
     }
 }
 
