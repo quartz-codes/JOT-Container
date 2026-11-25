@@ -78,6 +78,10 @@ impl WasmExecutor {
 
         linker.allow_shadowing(true);
 
+        // override fd_write to check output limit
+        // if the instance tries to write more than the limit, LimitedStdout returns io::ErrorKind::StorageFull,
+        // which is equivalent to ENOSPC in WASI.
+        // if ENOSPC is returned, fd_write immediately traps the instance and executor returns ExecuteError::OutputLimitExceeded
         linker
             .func_wrap(
                 "wasi_snapshot_preview1",
@@ -138,6 +142,8 @@ impl WasmExecutor {
             .map_err(|_| ExecuteError::RuntimeError {
                 reason: Some("linker.func_wrap() failed".into()),
             })?;
+
+        linker.allow_shadowing(false);
 
         Ok(Self {
             engine,
