@@ -2,7 +2,15 @@ use super::{ExecuteError, ExecuteResult, Executor};
 use async_trait::async_trait;
 use lazy_static::lazy_static;
 use std::sync::Arc;
+use std::{
+    io,
+    pin::Pin,
+    sync::atomic::{AtomicBool, Ordering},
+    task::{Context, Poll},
+};
+use tokio::io::AsyncWrite;
 use wasmtime::{Config, Engine, Linker, Module, ResourceLimiter, Store, Trap};
+use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
 use wasmtime_wasi::{HostMonotonicClock, HostWallClock, I32Exit};
 use wasmtime_wasi::{
     WasiCtx, WasiCtxView, WasiView,
@@ -163,6 +171,67 @@ impl ResourceLimiter for MemoryLimiter {
     }
 }
 
+#[derive(Clone)]
+struct LimitedStdout {
+    pipe: MemoryOutputPipe,
+    exceeded: Arc<AtomicBool>,
+}
+
+impl LimitedStdout {
+    fn new(capacity: usize) -> Self {
+        Self {
+            pipe: MemoryOutputPipe::new(capacity),
+            exceeded: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn exceeded(&self) -> Arc<AtomicBool> {
+        self.exceeded.clone()
+    }
+
+    fn contents(&self) -> bytes::Bytes {
+        self.pipe.contents()
+    }
+}
+
+impl IsTerminal for LimitedStdout {
+    fn is_terminal(&self) -> bool {
+        false
+    }
+}
+
+impl StdoutStream for LimitedStdout {
+    fn async_stream(&self) -> Box<dyn AsyncWrite + Send + Sync> {
+        Box::new(self.clone())
+    }
+}
+
+impl AsyncWrite for LimitedStdout {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let result = Pin::new(&mut self.pipe).poll_write(cx, buf);
+
+        if let Poll::Ready(Ok(n)) = &result {
+            if *n < buf.len() {
+                self.exceeded.store(true, Ordering::Relaxed);
+            }
+        }
+
+        result
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.pipe).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.pipe).poll_shutdown(cx)
+    }
+}
+
 #[async_trait]
 impl Executor for WasmExecutor {
     async fn execute(
@@ -174,16 +243,8 @@ impl Executor for WasmExecutor {
     ) -> Result<ExecuteResult, ExecuteError> {
         let input = String::from(input);
 
-        // MemoryOutputPipe does not make trap when output limit is exceeded when running on WASI p1
-        // This is temproral implementation, and it needs to be fixed in the future
-        let output_limit = if let Some(output_limit) = output_limit {
-            output_limit + 1
-        } else {
-            usize::MAX
-        };
-
         let memory_input = MemoryInputPipe::new(input);
-        let memory_output = Arc::new(MemoryOutputPipe::new(output_limit));
+        let memory_output = Arc::new(LimitedStdout::new(output_limit.unwrap_or(usize::MAX)));
         let memory_error_output = Arc::new(MemoryOutputPipe::new(1048576));
 
         let wasi = WasiCtx::builder()
@@ -261,9 +322,9 @@ impl Executor for WasmExecutor {
         };
 
         match result {
-            Ok(()) if memory_output.contents().len() >= output_limit => {
-                Err(ExecuteError::OutputLimitExceeded(output_limit - 1))
-            }
+            Ok(()) if memory_output.exceeded().load(Ordering::Relaxed) => Err(
+                ExecuteError::OutputLimitExceeded(output_limit.unwrap_or(usize::MAX)),
+            ),
             Ok(()) => Ok(ExecuteResult {
                 output: String::from_utf8_lossy(memory_output.contents().iter().as_slice()).into(),
                 memory_used: (store.data().limit.memory_used + store.data().limit.table_used)
