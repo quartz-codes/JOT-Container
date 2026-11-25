@@ -11,6 +11,7 @@ pub mod testcase;
 pub struct ProblemRuntimeLimits {
     pub memory_byte_limit: u64,
     pub instruction_count_limit: u64,
+    pub output_bytes_limit_multiplier: f32,
 }
 
 pub struct JudgeQueue {

@@ -17,6 +17,7 @@ pub enum SubproblemVerdict {
     RuntimeError(String),
     TimeLimitExceeded(u64),
     MemoryLimitExceeded(u64),
+    OutputLimitExceeded(usize),
 }
 
 pub type GraderResult = Result<SubproblemVerdict, String>;
@@ -62,7 +63,11 @@ impl<C: Checker + 'static, E: Executor + 'static> Grader<C, E> {
                             input,
                             problem_limits.memory_byte_limit,
                             problem_limits.instruction_count_limit,
-                            Some(1048576.max(answer.len() * 2)),
+                            Some(
+                                (answer.len() as f64
+                                    * f64::from(problem_limits.output_bytes_limit_multiplier))
+                                    as usize,
+                            ),
                         )
                         .await;
                     let ExecuteResult {
@@ -77,9 +82,8 @@ impl<C: Checker + 'static, E: Executor + 'static> Grader<C, E> {
                         Err(ExecuteError::MemoryLimitExceeded(limit)) => {
                             break 'grading Ok(SubproblemVerdict::MemoryLimitExceeded(limit));
                         }
-                        Err(ExecuteError::OutputLimitExceeded(_limit)) => {
-                            let message = "Output Limit Exceeded".into();
-                            break 'grading Ok(SubproblemVerdict::RuntimeError(message));
+                        Err(ExecuteError::OutputLimitExceeded(limit)) => {
+                            break 'grading Ok(SubproblemVerdict::OutputLimitExceeded(limit));
                         }
                         Err(ExecuteError::RuntimeError { reason }) => {
                             let message = reason.unwrap_or_else(|| "Unknown runtime error".into());

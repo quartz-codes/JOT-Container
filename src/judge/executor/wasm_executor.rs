@@ -217,6 +217,10 @@ impl AsyncWrite for LimitedStdout {
         if let Poll::Ready(Ok(n)) = &result {
             if *n < buf.len() {
                 self.exceeded.store(true, Ordering::Relaxed);
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "Output limit exceeded",
+                )));
             }
         }
 

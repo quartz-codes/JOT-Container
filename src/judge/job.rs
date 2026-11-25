@@ -175,6 +175,7 @@ impl JudgeJob {
                 ProblemRuntimeLimits {
                     memory_byte_limit: self.request.memory_bytes_limit,
                     instruction_count_limit: self.request.instruction_count_limit,
+                    output_bytes_limit_multiplier: self.request.output_bytes_limit_multiplier,
                 },
             );
 
@@ -293,6 +294,17 @@ impl From<SubproblemVerdict> for jot_proto::SubproblemVerdict {
                     ),
                 ),
             },
+            SubproblemVerdict::OutputLimitExceeded(max_output_bytes) => {
+                jot_proto::SubproblemVerdict {
+                    subproblem_verdict: Some(
+                        jot_proto::subproblem_verdict::SubproblemVerdict::OutputSizeLimitExceeded(
+                            jot_proto::SubproblemOle {
+                                max_output_bytes: max_output_bytes as u64,
+                            },
+                        ),
+                    ),
+                }
+            }
         }
     }
 }
