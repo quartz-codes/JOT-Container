@@ -23,6 +23,7 @@ dependencies = [
  "tonic-prost",
  "wasmtime",
  "wasmtime-wasi",
+ "wiggle",
 ]
 
 [[package]]
