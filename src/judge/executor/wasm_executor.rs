@@ -2,7 +2,18 @@ use super::{ExecuteError, ExecuteResult, Executor};
 use async_trait::async_trait;
 use lazy_static::lazy_static;
 use std::sync::Arc;
-use wasmtime::{Config, Engine, Linker, Module, ResourceLimiter, Store, Trap};
+use std::{
+    io,
+    pin::Pin,
+    sync::atomic::{AtomicBool, Ordering},
+    task::{Context, Poll},
+};
+use tokio::io::AsyncWrite;
+use wasmtime::{
+    AsContextMut, Caller, Config, Engine, Extern, Linker, Module, ResourceLimiter, Store, Trap,
+};
+use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
+use wasmtime_wasi::p1::wasi_snapshot_preview1::WasiSnapshotPreview1;
 use wasmtime_wasi::{HostMonotonicClock, HostWallClock, I32Exit};
 use wasmtime_wasi::{
     WasiCtx, WasiCtxView, WasiView,
@@ -65,13 +76,57 @@ impl WasmExecutor {
             });
         }
 
+        linker.allow_shadowing(true);
+
+        // override fd_write to check output limit
+        // if the instance tries to write more than the limit, LimitedStdout returns io::ErrorKind::StorageFull,
+        // which is equivalent to ENOSPC in WASI.
+        // if ENOSPC is returned, fd_write immediately traps the instance and executor returns ExecuteError::OutputLimitExceeded
+        linker
+            .func_wrap(
+                "wasi_snapshot_preview1",
+                "fd_write",
+                |mut caller: Caller<'_, MemoryCheckState>,
+                 fd: i32,
+                 iovs: i32,
+                 iovs_len: i32,
+                 nwritten: i32|
+                 -> wasmtime::Result<i32> {
+                    let memory = caller.get_export("memory");
+                    let fuel = caller.as_context_mut().hostcall_fuel();
+                    let (mut memory, state) = match memory {
+                        Some(Extern::Memory(memory)) => {
+                            let (memory, state) = memory.data_and_store_mut(&mut caller);
+                            (wiggle::GuestMemory::Unshared(memory), state)
+                        }
+                        _ => return Err(wasmtime::Error::msg("missing required memory export")),
+                    };
+                    state.ctx.set_hostcall_fuel(fuel);
+                    let errno = wasmtime_wasi::runtime::in_tokio(
+                        wasmtime_wasi::p1::wasi_snapshot_preview1::fd_write(
+                            &mut state.ctx,
+                            &mut memory,
+                            fd,
+                            iovs,
+                            iovs_len,
+                            nwritten,
+                        ),
+                    )?;
+                    if errno == wasmtime_wasi::p1::types::Errno::Nospc as i32 {
+                        return Err(wasmtime::Error::msg("fd_write: StorageFull"));
+                    }
+                    Ok(errno)
+                },
+            )
+            .map_err(|_| ExecuteError::RuntimeError {
+                reason: Some("linker.func_wrap() failed".into()),
+            })?;
+
         // shadow implementation of `poll_oneoff` to preventing sleeping
         // it immediately traps the instance if it tries to call poll_oneoff
         // it can prevent something like sleep() on <unistd.h>
         // but it may have side effects about input/output
         // currently our input stream immediately returns some value or EOF, so this works fine
-        linker.allow_shadowing(true);
-
         linker
             .func_wrap(
                 "wasi_snapshot_preview1",
@@ -87,6 +142,8 @@ impl WasmExecutor {
             .map_err(|_| ExecuteError::RuntimeError {
                 reason: Some("linker.func_wrap() failed".into()),
             })?;
+
+        linker.allow_shadowing(false);
 
         Ok(Self {
             engine,
@@ -163,6 +220,71 @@ impl ResourceLimiter for MemoryLimiter {
     }
 }
 
+#[derive(Clone)]
+struct LimitedStdout {
+    pipe: MemoryOutputPipe,
+    exceeded: Arc<AtomicBool>,
+}
+
+impl LimitedStdout {
+    fn new(capacity: usize) -> Self {
+        Self {
+            pipe: MemoryOutputPipe::new(capacity),
+            exceeded: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn exceeded(&self) -> Arc<AtomicBool> {
+        self.exceeded.clone()
+    }
+
+    fn contents(&self) -> bytes::Bytes {
+        self.pipe.contents()
+    }
+}
+
+impl IsTerminal for LimitedStdout {
+    fn is_terminal(&self) -> bool {
+        false
+    }
+}
+
+impl StdoutStream for LimitedStdout {
+    fn async_stream(&self) -> Box<dyn AsyncWrite + Send + Sync> {
+        Box::new(self.clone())
+    }
+}
+
+impl AsyncWrite for LimitedStdout {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let result = Pin::new(&mut self.pipe).poll_write(cx, buf);
+
+        if let Poll::Ready(Ok(n)) = &result {
+            if *n < buf.len() {
+                self.exceeded.store(true, Ordering::Relaxed);
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "Output limit exceeded",
+                )));
+            }
+        }
+
+        result
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.pipe).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.pipe).poll_shutdown(cx)
+    }
+}
+
 #[async_trait]
 impl Executor for WasmExecutor {
     async fn execute(
@@ -170,11 +292,12 @@ impl Executor for WasmExecutor {
         input: &str,
         memory_limit: u64,
         time_limit: u64,
+        output_limit: usize,
     ) -> Result<ExecuteResult, ExecuteError> {
         let input = String::from(input);
 
         let memory_input = MemoryInputPipe::new(input);
-        let memory_output = Arc::new(MemoryOutputPipe::new(1048576));
+        let memory_output = Arc::new(LimitedStdout::new(output_limit));
         let memory_error_output = Arc::new(MemoryOutputPipe::new(1048576));
 
         let wasi = WasiCtx::builder()
@@ -252,6 +375,9 @@ impl Executor for WasmExecutor {
         };
 
         match result {
+            _ if memory_output.exceeded().load(Ordering::Relaxed) => {
+                Err(ExecuteError::OutputLimitExceeded(output_limit))
+            }
             Ok(()) => Ok(ExecuteResult {
                 output: String::from_utf8_lossy(memory_output.contents().iter().as_slice()).into(),
                 memory_used: (store.data().limit.memory_used + store.data().limit.table_used)
@@ -281,7 +407,7 @@ async fn test_wasm() {
     )
     .expect("Failed to create WasmExecutor");
     let res = executor
-        .execute("1 2", 1048576, 100000)
+        .execute("1 2", 1048576, 100000, usize::MAX)
         .await
         .expect("Runtime error");
     assert_eq!(res.output.trim(), "3");
@@ -292,7 +418,7 @@ async fn test_wasm_tle() {
         include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/aplusb.wasm")).to_vec(),
     )
     .expect("Failed to create WasmExecutor");
-    let result = executor.execute("1 2", 1048576, 10).await;
+    let result = executor.execute("1 2", 1048576, 10, usize::MAX).await;
     assert!(matches!(result, Err(ExecuteError::TimeLimitExceeded(_))));
 }
 #[tokio::test]
@@ -301,7 +427,7 @@ async fn test_wasm_mle() {
         include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/aplusb.wasm")).to_vec(),
     )
     .expect("Failed to create WasmExecutor");
-    let result = executor.execute("1 2", 1000, 100000).await;
+    let result = executor.execute("1 2", 1000, 100000, usize::MAX).await;
     assert!(matches!(result, Err(ExecuteError::MemoryLimitExceeded(_))));
 }
 
@@ -314,7 +440,7 @@ async fn test_wasm_sleep() {
     )
     .expect("Failed to create WasmExecutor");
     executor
-        .execute("", 100000000, 100000000)
+        .execute("", 100000000, 100000000, usize::MAX)
         .await
         .expect("Runtime error");
 }
@@ -341,7 +467,7 @@ async fn test_long_input_scanf() {
     .expect("Failed to create WasmExecutor");
     let input = generate_long_input();
     let result = executor
-        .execute(&input, 100000000, 1000000000)
+        .execute(&input, 100000000, 1000000000, usize::MAX)
         .await
         .expect("Runtime error");
 
@@ -360,9 +486,49 @@ async fn test_long_input_cin() {
     .expect("Failed to create WasmExecutor");
     let input = generate_long_input();
     let result = executor
-        .execute(&input, 100000000, 1000000000)
+        .execute(&input, 100000000, 1000000000, usize::MAX)
         .await
         .expect("Runtime error");
 
     assert_eq!(result.output.trim(), input.trim());
+}
+
+#[tokio::test]
+async fn test_wasm_output_limit() {
+    let executor = WasmExecutor::new(
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/fixtures/long_input_scanf_strip.wasm"
+        ))
+        .to_vec(),
+    )
+    .expect("Failed to create WasmExecutor");
+
+    let input = generate_long_input();
+    let result = executor.execute(&input, 100000000, 1000000000, 10).await;
+    assert!(matches!(result, Err(ExecuteError::OutputLimitExceeded(10))));
+}
+
+#[tokio::test]
+async fn test_fd_write_interceptor() {
+    let wasm = br#"(module
+        (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 16) "hello")
+        (func (export "_start")
+            (i32.store (i32.const 0) (i32.const 16))
+            (i32.store (i32.const 4) (i32.const 5))
+            (if (i32.ne (call $fd_write (i32.const 99) (i32.const 0) (i32.const 1) (i32.const 8)) (i32.const 8))
+                (then unreachable))
+            (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))
+            (i32.store (i32.const 12) (i32.const 1))))"#;
+    let executor = WasmExecutor::new(wasm.to_vec()).unwrap();
+
+    let result = executor.execute("", 1048576, 100000, 5).await.unwrap();
+    assert_eq!(result.output, "hello");
+
+    assert!(matches!(
+        executor.execute("", 1048576, 100000, 0).await,
+        Err(ExecuteError::OutputLimitExceeded(0))
+    ));
 }

@@ -8,6 +8,7 @@ use async_trait::async_trait;
 pub enum ExecuteError {
     TimeLimitExceeded(u64),
     MemoryLimitExceeded(u64),
+    OutputLimitExceeded(usize),
     RuntimeError { reason: Option<String> },
 }
 #[derive(Debug)]
@@ -24,6 +25,7 @@ pub trait Executor: Send + Sync {
         input: &str,
         memory_limit: u64,
         time_limit: u64,
+        output_limit: usize,
     ) -> Result<ExecuteResult, ExecuteError>;
 }
 
@@ -34,8 +36,11 @@ impl<T: Executor + ?Sized> Executor for Arc<T> {
         input: &str,
         memory_limit: u64,
         time_limit: u64,
+        output_limit: usize,
     ) -> Result<ExecuteResult, ExecuteError> {
-        (**self).execute(input, memory_limit, time_limit).await
+        (**self)
+            .execute(input, memory_limit, time_limit, output_limit)
+            .await
     }
 }
 
