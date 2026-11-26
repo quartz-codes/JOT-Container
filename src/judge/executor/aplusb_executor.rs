@@ -20,7 +20,7 @@ impl Executor for APlusBExecutor {
         input: &str,
         memory_limit: u64,
         time_limit: u64,
-        output_limit: Option<usize>,
+        output_limit: usize,
     ) -> Result<ExecuteResult, ExecuteError> {
         if time_limit < 100 {
             return Err(ExecuteError::TimeLimitExceeded(time_limit));
@@ -35,10 +35,8 @@ impl Executor for APlusBExecutor {
             .collect::<Vec<_>>();
         let (a, b) = (sp[0], sp[1]);
         let res = a + b;
-        if let Some(output_limit) = output_limit {
-            if res.to_string().len() > output_limit {
-                return Err(ExecuteError::OutputLimitExceeded(output_limit));
-            }
+        if res.to_string().len() > output_limit {
+            return Err(ExecuteError::OutputLimitExceeded(output_limit));
         }
 
         Ok(ExecuteResult {
@@ -57,7 +55,7 @@ mod tests {
     async fn test_1() {
         let executor: Box<dyn Executor> = Box::new(APlusBExecutor::new());
         let res = executor
-            .execute("1 2", 1048576, 100000, None)
+            .execute("1 2", 1048576, 100000, usize::MAX)
             .await
             .expect("Runtime error");
         assert_eq!(res.output, "3");
@@ -66,7 +64,7 @@ mod tests {
     async fn test_2() {
         let executor: Box<dyn Executor> = Box::new(APlusBExecutor::new());
         let res = executor
-            .execute("100 200", 1048576, 100000, None)
+            .execute("100 200", 1048576, 100000, usize::MAX)
             .await
             .expect("Runtime error");
         assert_eq!(res.output, "300");
@@ -75,7 +73,7 @@ mod tests {
     async fn test_3() {
         let executor: Box<dyn Executor> = Box::new(APlusBExecutor::new());
         let res = executor
-            .execute("123 45", 1048576, 100000, None)
+            .execute("123 45", 1048576, 100000, usize::MAX)
             .await
             .expect("Runtime error");
         assert_eq!(res.output, "168");

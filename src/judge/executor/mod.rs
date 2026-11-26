@@ -25,7 +25,7 @@ pub trait Executor: Send + Sync {
         input: &str,
         memory_limit: u64,
         time_limit: u64,
-        output_limit: Option<usize>,
+        output_limit: usize,
     ) -> Result<ExecuteResult, ExecuteError>;
 }
 
@@ -36,7 +36,7 @@ impl<T: Executor + ?Sized> Executor for Arc<T> {
         input: &str,
         memory_limit: u64,
         time_limit: u64,
-        output_limit: Option<usize>,
+        output_limit: usize,
     ) -> Result<ExecuteResult, ExecuteError> {
         (**self)
             .execute(input, memory_limit, time_limit, output_limit)

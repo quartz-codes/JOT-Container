@@ -292,12 +292,12 @@ impl Executor for WasmExecutor {
         input: &str,
         memory_limit: u64,
         time_limit: u64,
-        output_limit: Option<usize>,
+        output_limit: usize,
     ) -> Result<ExecuteResult, ExecuteError> {
         let input = String::from(input);
 
         let memory_input = MemoryInputPipe::new(input);
-        let memory_output = Arc::new(LimitedStdout::new(output_limit.unwrap_or(usize::MAX)));
+        let memory_output = Arc::new(LimitedStdout::new(output_limit));
         let memory_error_output = Arc::new(MemoryOutputPipe::new(1048576));
 
         let wasi = WasiCtx::builder()
@@ -375,9 +375,9 @@ impl Executor for WasmExecutor {
         };
 
         match result {
-            _ if memory_output.exceeded().load(Ordering::Relaxed) => Err(
-                ExecuteError::OutputLimitExceeded(output_limit.unwrap_or(usize::MAX)),
-            ),
+            _ if memory_output.exceeded().load(Ordering::Relaxed) => {
+                Err(ExecuteError::OutputLimitExceeded(output_limit))
+            }
             Ok(()) => Ok(ExecuteResult {
                 output: String::from_utf8_lossy(memory_output.contents().iter().as_slice()).into(),
                 memory_used: (store.data().limit.memory_used + store.data().limit.table_used)
@@ -407,7 +407,7 @@ async fn test_wasm() {
     )
     .expect("Failed to create WasmExecutor");
     let res = executor
-        .execute("1 2", 1048576, 100000, None)
+        .execute("1 2", 1048576, 100000, usize::MAX)
         .await
         .expect("Runtime error");
     assert_eq!(res.output.trim(), "3");
@@ -418,7 +418,7 @@ async fn test_wasm_tle() {
         include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/aplusb.wasm")).to_vec(),
     )
     .expect("Failed to create WasmExecutor");
-    let result = executor.execute("1 2", 1048576, 10, None).await;
+    let result = executor.execute("1 2", 1048576, 10, usize::MAX).await;
     assert!(matches!(result, Err(ExecuteError::TimeLimitExceeded(_))));
 }
 #[tokio::test]
@@ -427,7 +427,7 @@ async fn test_wasm_mle() {
         include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/aplusb.wasm")).to_vec(),
     )
     .expect("Failed to create WasmExecutor");
-    let result = executor.execute("1 2", 1000, 100000, None).await;
+    let result = executor.execute("1 2", 1000, 100000, usize::MAX).await;
     assert!(matches!(result, Err(ExecuteError::MemoryLimitExceeded(_))));
 }
 
@@ -440,7 +440,7 @@ async fn test_wasm_sleep() {
     )
     .expect("Failed to create WasmExecutor");
     executor
-        .execute("", 100000000, 100000000, None)
+        .execute("", 100000000, 100000000, usize::MAX)
         .await
         .expect("Runtime error");
 }
@@ -467,7 +467,7 @@ async fn test_long_input_scanf() {
     .expect("Failed to create WasmExecutor");
     let input = generate_long_input();
     let result = executor
-        .execute(&input, 100000000, 1000000000, None)
+        .execute(&input, 100000000, 1000000000, usize::MAX)
         .await
         .expect("Runtime error");
 
@@ -486,7 +486,7 @@ async fn test_long_input_cin() {
     .expect("Failed to create WasmExecutor");
     let input = generate_long_input();
     let result = executor
-        .execute(&input, 100000000, 1000000000, None)
+        .execute(&input, 100000000, 1000000000, usize::MAX)
         .await
         .expect("Runtime error");
 
@@ -505,9 +505,7 @@ async fn test_wasm_output_limit() {
     .expect("Failed to create WasmExecutor");
 
     let input = generate_long_input();
-    let result = executor
-        .execute(&input, 100000000, 1000000000, Some(10))
-        .await;
+    let result = executor.execute(&input, 100000000, 1000000000, 10).await;
     assert!(matches!(result, Err(ExecuteError::OutputLimitExceeded(10))));
 }
 
@@ -526,14 +524,11 @@ async fn test_fd_write_interceptor() {
             (i32.store (i32.const 12) (i32.const 1))))"#;
     let executor = WasmExecutor::new(wasm.to_vec()).unwrap();
 
-    let result = executor
-        .execute("", 1048576, 100000, Some(5))
-        .await
-        .unwrap();
+    let result = executor.execute("", 1048576, 100000, 5).await.unwrap();
     assert_eq!(result.output, "hello");
 
     assert!(matches!(
-        executor.execute("", 1048576, 100000, Some(0)).await,
+        executor.execute("", 1048576, 100000, 0).await,
         Err(ExecuteError::OutputLimitExceeded(0))
     ));
 }

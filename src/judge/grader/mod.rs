@@ -63,11 +63,9 @@ impl<C: Checker + 'static, E: Executor + 'static> Grader<C, E> {
                             input,
                             problem_limits.memory_byte_limit,
                             problem_limits.instruction_count_limit,
-                            Some(
-                                (answer.len() as f64
-                                    * f64::from(problem_limits.output_bytes_limit_multiplier))
-                                    as usize,
-                            ),
+                            (answer.len() as f64
+                                * f64::from(problem_limits.output_bytes_limit_multiplier))
+                                as usize,
                         )
                         .await;
                     let ExecuteResult {
